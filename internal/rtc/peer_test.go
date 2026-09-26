@@ -21,13 +21,16 @@ func TestOfferAnswerLoopbackDeliversInputEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, offer, err := NewPeer(api, cfg, track)
+	got := make(chan string, 1)
+	connected := make(chan struct{}, 1)
+	host, offer, err := NewPeer(api, cfg, track, Callbacks{
+		OnData:      func(label string, data []byte) { got <- label + ":" + string(data) },
+		OnConnected: func() { connected <- struct{}{} },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer host.Close()
-	got := make(chan string, 1)
-	host.OnData = func(label string, data []byte) { got <- label + ":" + string(data) }
 
 	se := webrtc.SettingEngine{}
 	se.SetIncludeLoopbackCandidate(true)
@@ -56,8 +59,17 @@ func TestOfferAnswerLoopbackDeliversInputEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-g
+	// A candidate trickled before the answer is queued, not an error.
+	if err := host.AddICECandidate(webrtc.ICECandidateInit{Candidate: ""}); err != nil {
+		t.Fatal(err)
+	}
 	if err := host.SetAnswer(viewer.LocalDescription().SDP); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-connected:
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnConnected never fired")
 	}
 	select {
 	case m := <-got:
@@ -72,5 +84,61 @@ func TestOfferAnswerLoopbackDeliversInputEvents(t *testing.T) {
 	_, port, _ := net.SplitHostPort(f[1])
 	if len(f) < 2 || port < "40380" || port > "40389" {
 		t.Fatalf("selected pair %q outside port range", host.SelectedPair())
+	}
+}
+
+// Stage 6: a TURN server that never answers (the hairpinned relay, at its
+// worst) must not turn into "ice gathering timed out" and a failed session:
+// after GatherTimeout the offer goes out with the host candidates it has.
+func TestGatherTimeoutStillOffersHostCandidates(t *testing.T) {
+	old := GatherTimeout
+	GatherTimeout = 700 * time.Millisecond
+	defer func() { GatherTimeout = old }()
+	// 192.0.2.0/24 is TEST-NET-1: nothing answers there.
+	cfg := Config{PortMin: 40380, PortMax: 40389, IncludeLoopback: true,
+		ICEServers: []webrtc.ICEServer{{URLs: []string{"turn:192.0.2.1:3478"}, Username: "u", Credential: "c"}}}
+	api, err := NewAPI(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	track, _ := NewVideoTrackRTP()
+	p, sdp, g, err := NewPeerGather(api, cfg, track, Callbacks{})
+	if err != nil {
+		t.Fatalf("offer failed: %v (%s)", err, g)
+	}
+	defer p.Close()
+	if !g.Partial || g.Counts["host"] == 0 || g.Counts["relay"] != 0 {
+		t.Fatalf("gather %s", g)
+	}
+	if !strings.Contains(sdp, "typ host") {
+		t.Fatalf("offer has no host candidate:\n%s", sdp)
+	}
+}
+
+func TestCountCandidates(t *testing.T) {
+	sdp := "v=0\r\na=candidate:1 1 udp 2130706431 192.168.1.107 40300 typ host\r\n" +
+		"a=candidate:2 1 udp 16777215 107.143.179.17 40001 typ relay raddr 0.0.0.0 rport 5\r\n" +
+		"a=candidate:3 1 udp 2130706431 127.0.0.1 40301 typ host\r\n"
+	got := CountCandidates(sdp)
+	if got["host"] != 2 || got["relay"] != 1 || got["srflx"] != 0 {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestCloseIsNilSafeAndIdempotent(t *testing.T) {
+	var nilPeer *Peer
+	nilPeer.Close()
+	cfg := Config{PortMin: 40390, PortMax: 40399, IncludeLoopback: true}
+	api, _ := NewAPI(cfg)
+	track, _ := NewVideoTrackRTP()
+	done := 0
+	p, _, err := NewPeer(api, cfg, track, Callbacks{OnDone: func(string) { done++ }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+	p.Close()
+	if done != 1 {
+		t.Fatalf("OnDone fired %d times", done)
 	}
 }

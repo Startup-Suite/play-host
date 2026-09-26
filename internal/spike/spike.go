@@ -338,29 +338,30 @@ func (h *harness) mux(cfg rtc.Config) http.Handler {
 	sub, _ := fs.Sub(webFS, "web")
 	m.Handle("GET /", http.FileServerFS(sub))
 	m.HandleFunc("POST /offer", func(w http.ResponseWriter, r *http.Request) {
-		p, sdp, err := rtc.NewPeer(h.api, cfg, h.track)
+		id := fmt.Sprintf("v%d", time.Now().UnixNano())
+		p, sdp, err := rtc.NewPeer(h.api, cfg, h.track, rtc.Callbacks{
+			OnPLI: func() {
+				h.logf("PLI/FIR from %s (subprocess encoder: bounded GOP %d, no forced IDR)", id, h.o.Preset.GOPFrames)
+			},
+			OnData: func(label string, data []byte) {
+				var msg struct {
+					T   string `json:"t"`
+					Seq int    `json:"seq"`
+				}
+				if json.Unmarshal(data, &msg) == nil && msg.T == "probe" {
+					h.sendProbe(msg.Seq)
+				}
+			},
+			OnDone: func(reason string) {
+				h.logf("peer %s done: %s", id, reason)
+				h.peersMu.Lock()
+				delete(h.peers, id)
+				h.peersMu.Unlock()
+			},
+		})
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
-		}
-		id := fmt.Sprintf("v%d", time.Now().UnixNano())
-		p.OnPLI = func() {
-			h.logf("PLI/FIR from %s (subprocess encoder: bounded GOP %d, no forced IDR)", id, h.o.Preset.GOPFrames)
-		}
-		p.OnData = func(label string, data []byte) {
-			var msg struct {
-				T   string `json:"t"`
-				Seq int    `json:"seq"`
-			}
-			if json.Unmarshal(data, &msg) == nil && msg.T == "probe" {
-				h.sendProbe(msg.Seq)
-			}
-		}
-		p.OnDone = func(reason string) {
-			h.logf("peer %s done: %s", id, reason)
-			h.peersMu.Lock()
-			delete(h.peers, id)
-			h.peersMu.Unlock()
 		}
 		h.peersMu.Lock()
 		h.peers[id] = p

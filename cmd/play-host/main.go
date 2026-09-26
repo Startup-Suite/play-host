@@ -1,5 +1,7 @@
 // Command play-host serves a Godot build to one browser over WebRTC.
-// Stage 1 (task 01a0db5f) ships only the spike subcommand.
+//
+//	play-host serve -config C:\Users\slaps\play-host\config.json   (stage 3: the Suite play host)
+//	play-host spike [flags]                                          (stage 1: the frame-path harness)
 package main
 
 import (
@@ -14,8 +16,20 @@ import (
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "keynames" {
+		if err := keynames(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "serve" {
+		if err := serve(os.Args[2:]); err != nil {
+			log.Fatalf("serve: %v", err)
+		}
+		return
+	}
 	if len(os.Args) < 2 || os.Args[1] != "spike" {
-		fmt.Fprintln(os.Stderr, "usage: play-host spike [flags]")
+		fmt.Fprintln(os.Stderr, "usage: play-host serve -config <config.json> | play-host spike [flags]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("spike", flag.ExitOnError)

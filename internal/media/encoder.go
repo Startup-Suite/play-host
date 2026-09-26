@@ -31,6 +31,15 @@ func DefaultPreset() Preset {
 	return Preset{Preset: "p4", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
 }
 
+// ControlPreset is stage 1's measured control arm and core's
+// GameStreamEncoder.control/0: p1 / ll, 8000 kbps CBR, 1280x720 at 60 fps,
+// GOP 120. Width and height are what the host ASKS Godot for; the session-0
+// desktop clamps the window (1028x720 on wave), and the encoder is always
+// sized from the frames the addon actually exports.
+func ControlPreset() Preset {
+	return Preset{Preset: "p1", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
+}
+
 // Validate rejects values ffmpeg would refuse or that make no sense on a LAN.
 func (p Preset) Validate() error {
 	switch p.Preset {
@@ -47,8 +56,10 @@ func (p Preset) Validate() error {
 	if p.FPS < 10 || p.FPS > 144 {
 		return fmt.Errorf("fps %d out of 10..144", p.FPS)
 	}
-	if p.Width < 64 || p.Height < 64 || p.Width%2 != 0 || p.Height%2 != 0 {
-		return fmt.Errorf("size %dx%d must be even and >= 64", p.Width, p.Height)
+	// Parity is not checked: core's surface allows odd sizes, the size is only
+	// a window request, and RawInputArgs crops odd frames to even.
+	if p.Width < 64 || p.Height < 64 || p.Width > 7680 || p.Height > 4320 {
+		return fmt.Errorf("size %dx%d out of 64x64..7680x4320", p.Width, p.Height)
 	}
 	if p.GOPFrames < 1 {
 		return fmt.Errorf("gop_frames %d must be >= 1", p.GOPFrames)
@@ -121,13 +132,18 @@ func OutputArgs(f Framing, rtpPort int) []string {
 
 // RawInputArgs reads raw frames on stdin at wall-clock timestamps (frame path C).
 // NVENC accepts rgba/bgra directly and converts to YUV on the GPU.
+// An odd frame size is cropped to even (a CPU filter hop, so only when needed).
 func RawInputArgs(pixFmt string, w, h, fps int) []string {
-	return []string{
+	a := []string{
 		"-f", "rawvideo", "-pix_fmt", pixFmt, "-video_size", fmt.Sprintf("%dx%d", w, h),
 		"-framerate", strconv.Itoa(fps), "-use_wallclock_as_timestamps", "1",
 		"-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32",
 		"-i", "pipe:0", "-fps_mode", "passthrough",
 	}
+	if w%2 != 0 || h%2 != 0 {
+		a = append(a, "-vf", fmt.Sprintf("crop=%d:%d:0:0", w&^1, h&^1))
+	}
+	return a
 }
 
 // DDAGrabInputArgs is frame path A (DXGI desktop duplication, D3D11 frames).

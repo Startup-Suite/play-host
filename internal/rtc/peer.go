@@ -11,11 +11,14 @@ package rtc
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/ice/v4"
+	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
@@ -26,6 +29,10 @@ type Config struct {
 	AllowIPs         []net.IP // host candidate addresses; empty = all
 	ICEServers       []webrtc.ICEServer
 	IncludeLoopback  bool // tests only
+	// LogWriter receives pion's ICE warnings (why a candidate type failed
+	// to gather) and every scope's errors; nil keeps pion's default (errors
+	// to stdout, which the scheduled task does not capture).
+	LogWriter io.Writer
 }
 
 // Channel labels shared with the browser.
@@ -34,17 +41,73 @@ const (
 	LabelInputEvents = "input-events" // reliable, ordered; key edges and probes
 )
 
+// Callbacks are fixed at NewPeer, before any pion goroutine can call them.
+type Callbacks struct {
+	OnPLI       func()
+	OnData      func(label string, data []byte)
+	OnConnected func()
+	// OnDone fires once: Failed, Closed, or Disconnected for longer than
+	// DisconnectGrace (ICE can recover from a short Disconnected).
+	OnDone func(reason string)
+}
+
+// DisconnectGrace is how long Disconnected may last before the peer is done.
+var DisconnectGrace = 5 * time.Second
+
+// GatherTimeout bounds ICE gathering for one offer. When it expires the
+// offer still goes out if it already carries a host candidate: a LAN viewer
+// needs nothing else, and a slow TURN allocation (the relay server is
+// reached through the router's hairpin) must not fail the session. Only an
+// offer with no host candidate at all is an error (stage 6: a re-offer that
+// timed out here used to end a live session).
+var GatherTimeout = 5 * time.Second
+
+// Gather describes how one offer's ICE gathering went, for the host log.
+type Gather struct {
+	Took    time.Duration
+	Partial bool           // GatherTimeout expired before gathering completed
+	Counts  map[string]int // candidate type -> count in the offer SDP
+}
+
+func (g Gather) String() string {
+	return fmt.Sprintf("gathered in %s partial=%v host=%d srflx=%d relay=%d",
+		g.Took.Round(time.Millisecond), g.Partial, g.Counts["host"], g.Counts["srflx"], g.Counts["relay"])
+}
+
+// ErrNoHostCandidate is a gathering timeout with nothing a viewer could reach.
+var ErrNoHostCandidate = errors.New("ice gathering timed out with no host candidate")
+
+// CountCandidates counts `a=candidate` lines by type in an SDP.
+func CountCandidates(sdp string) map[string]int {
+	out := map[string]int{}
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "a=candidate:") {
+			continue
+		}
+		f := strings.Fields(line)
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "typ" {
+				out[f[i+1]]++
+				break
+			}
+		}
+	}
+	return out
+}
+
 // Peer is one viewer connection.
 type Peer struct {
-	pc     *webrtc.PeerConnection
-	Track  webrtc.TrackLocal
-	OnPLI  func()
-	OnData func(label string, data []byte)
-	OnDone func(reason string)
+	pc    *webrtc.PeerConnection
+	Track webrtc.TrackLocal
+	cb    Callbacks
 
-	mu     sync.Mutex
-	closed bool
-	pli    int
+	mu        sync.Mutex
+	closed    bool
+	pli       int
+	remoteSet bool
+	queued    []webrtc.ICECandidateInit
+	dcTimer   *time.Timer
 }
 
 // NewAPI builds a pion API from cfg.
@@ -58,6 +121,13 @@ func NewAPI(cfg Config) (*webrtc.API, error) {
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeQueryOnly)
 	se.SetIncludeLoopbackCandidate(cfg.IncludeLoopback)
+	if cfg.LogWriter != nil {
+		se.LoggerFactory = &logging.DefaultLoggerFactory{
+			Writer:          cfg.LogWriter,
+			DefaultLogLevel: logging.LogLevelError,
+			ScopeLevels:     map[string]logging.LogLevel{"ice": logging.LogLevelWarn},
+		}
+	}
 	if len(cfg.AllowIPs) > 0 {
 		allow := append([]net.IP(nil), cfg.AllowIPs...)
 		se.SetIPFilter(func(ip net.IP) bool {
@@ -90,17 +160,26 @@ func NewVideoTrackSample() (*webrtc.TrackLocalStaticSample, error) {
 }
 
 // NewPeer creates the connection, adds track and data channels, and returns
-// the complete (non-trickle) offer once ICE gathering finishes.
-func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal) (*Peer, string, error) {
+// the (non-trickle) offer once ICE gathering finishes, or once GatherTimeout
+// expires with at least one host candidate gathered (see GatherTimeout).
+func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal, cb Callbacks) (*Peer, string, error) {
+	p, sdp, _, err := NewPeerGather(api, cfg, track, cb)
+	return p, sdp, err
+}
+
+// NewPeerGather is NewPeer that also reports how gathering went.
+func NewPeerGather(api *webrtc.API, cfg Config, track webrtc.TrackLocal, cb Callbacks) (*Peer, string, Gather, error) {
+	var g Gather
+	t0 := time.Now()
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: cfg.ICEServers})
 	if err != nil {
-		return nil, "", err
+		return nil, "", g, err
 	}
-	p := &Peer{pc: pc, Track: track}
+	p := &Peer{pc: pc, Track: track, cb: cb}
 	tr, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
 	if err != nil {
 		pc.Close()
-		return nil, "", err
+		return nil, "", g, err
 	}
 	go p.readRTCP(tr.Sender())
 
@@ -115,18 +194,34 @@ func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal) (*Peer, strin
 		ch, err := pc.CreateDataChannel(dc.label, dc.init)
 		if err != nil {
 			pc.Close()
-			return nil, "", err
+			return nil, "", g, err
 		}
 		label := dc.label
 		ch.OnMessage(func(m webrtc.DataChannelMessage) {
-			if p.OnData != nil {
-				p.OnData(label, m.Data)
+			if p.cb.OnData != nil {
+				p.cb.OnData(label, m.Data)
 			}
 		})
 	}
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		switch s {
-		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateDisconnected:
+		case webrtc.PeerConnectionStateConnected:
+			p.mu.Lock()
+			if p.dcTimer != nil {
+				p.dcTimer.Stop()
+				p.dcTimer = nil
+			}
+			p.mu.Unlock()
+			if p.cb.OnConnected != nil {
+				p.cb.OnConnected()
+			}
+		case webrtc.PeerConnectionStateDisconnected:
+			p.mu.Lock()
+			if p.dcTimer == nil && !p.closed {
+				p.dcTimer = time.AfterFunc(DisconnectGrace, func() { p.finish("disconnected") })
+			}
+			p.mu.Unlock()
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			p.finish(s.String())
 		}
 	})
@@ -134,20 +229,26 @@ func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal) (*Peer, strin
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		pc.Close()
-		return nil, "", err
+		return nil, "", g, err
 	}
 	done := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(offer); err != nil {
 		pc.Close()
-		return nil, "", err
+		return nil, "", g, err
 	}
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		pc.Close()
-		return nil, "", errors.New("ice gathering timed out")
+	case <-time.After(GatherTimeout):
+		g.Partial = true
 	}
-	return p, pc.LocalDescription().SDP, nil
+	sdp := pc.LocalDescription().SDP
+	g.Took = time.Since(t0)
+	g.Counts = CountCandidates(sdp)
+	if g.Partial && g.Counts["host"] == 0 {
+		p.closeQuiet()
+		return nil, "", g, ErrNoHostCandidate
+	}
+	return p, sdp, g, nil
 }
 
 // readRTCP is ported from cloudplay webrtc.go:51-75.
@@ -168,8 +269,8 @@ func (p *Peer) readRTCP(s *webrtc.RTPSender) {
 				p.mu.Lock()
 				p.pli++
 				p.mu.Unlock()
-				if p.OnPLI != nil {
-					p.OnPLI()
+				if p.cb.OnPLI != nil {
+					p.cb.OnPLI()
 				}
 			}
 		}
@@ -179,9 +280,36 @@ func (p *Peer) readRTCP(s *webrtc.RTPSender) {
 // PLICount is how many PLI/FIR the viewer sent.
 func (p *Peer) PLICount() int { p.mu.Lock(); defer p.mu.Unlock(); return p.pli }
 
-// SetAnswer applies the browser's answer.
+// SetAnswer applies the browser's answer, then any candidates that arrived
+// before it.
 func (p *Peer) SetAnswer(sdp string) error {
-	return p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp})
+	if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.remoteSet = true
+	q := p.queued
+	p.queued = nil
+	p.mu.Unlock()
+	for _, c := range q {
+		if err := p.pc.AddICECandidate(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AddICECandidate adds a trickled viewer candidate, queueing it until the
+// answer is set.
+func (p *Peer) AddICECandidate(c webrtc.ICECandidateInit) error {
+	p.mu.Lock()
+	if !p.remoteSet {
+		p.queued = append(p.queued, c)
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Unlock()
+	return p.pc.AddICECandidate(c)
 }
 
 // SelectedPair describes the nominated candidate pair ("host", "srflx", "relay").
@@ -200,8 +328,26 @@ func (p *Peer) SelectedPair() string {
 // State is the peer connection state.
 func (p *Peer) State() string { return p.pc.ConnectionState().String() }
 
-// Close ends the connection.
-func (p *Peer) Close() { p.finish("closed by host"); _ = p.pc.Close() }
+// Close ends the connection and waits for pion to release its sockets, so
+// the next peer can bind in the same 10-port range. Safe on a nil Peer and
+// safe to call twice.
+func (p *Peer) Close() {
+	if p == nil {
+		return
+	}
+	p.finish("closed by host")
+	if p.pc != nil {
+		_ = p.pc.Close()
+	}
+}
+
+// closeQuiet closes a peer that never reached its caller: no OnDone.
+func (p *Peer) closeQuiet() {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	_ = p.pc.Close()
+}
 
 func (p *Peer) finish(reason string) {
 	p.mu.Lock()
@@ -210,8 +356,12 @@ func (p *Peer) finish(reason string) {
 		return
 	}
 	p.closed = true
+	if p.dcTimer != nil {
+		p.dcTimer.Stop()
+		p.dcTimer = nil
+	}
 	p.mu.Unlock()
-	if p.OnDone != nil {
-		p.OnDone(reason)
+	if p.cb.OnDone != nil {
+		p.cb.OnDone(reason)
 	}
 }

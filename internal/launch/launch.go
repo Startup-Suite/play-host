@@ -8,6 +8,8 @@
 // takes its Godot with it. Nothing is ever matched or killed by process name.
 package launch
 
+import "fmt"
+
 // Spec is one process to start.
 type Spec struct {
 	Path    string
@@ -24,4 +26,21 @@ type Proc interface {
 	Kill() error
 	// Pids lists the processes currently in the tree (Windows: the job).
 	Pids() ([]int, error)
+}
+
+// GodotArgs is the play command line:
+//
+//	--path <dir> --rendering-driver vulkan --resolution WxH --windowed
+//	-- --suite-play-session=<id> --suite-play-port=<port> --suite-play-fps=<fps>
+//
+// Vulkan because D3D12 fails in wave's session-0 S4U context (stage 1).
+// `--suite-play-session=` is the marker connery-godot-loop.ps1 exempts, so
+// the supervisor never reads a play session as a GUI editor. No
+// `--remote-debug` is ever passed, so the EngineDebugger channel stays
+// inactive.
+func GodotArgs(dir string, w, h int, session string, port, fps int) []string {
+	return []string{
+		"--path", dir, "--rendering-driver", "vulkan", "--resolution", fmt.Sprintf("%dx%d", w, h), "--windowed",
+		"--", "--suite-play-session=" + session, fmt.Sprintf("--suite-play-port=%d", port), fmt.Sprintf("--suite-play-fps=%d", fps),
+	}
 }

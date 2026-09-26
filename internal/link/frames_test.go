@@ -1,4 +1,4 @@
-package spike
+package link
 
 import (
 	"bytes"
