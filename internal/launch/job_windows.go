@@ -4,13 +4,15 @@ package launch
 
 import (
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 type jobProc struct {
-	job     windows.Handle
+	mu      sync.Mutex
+	job     windows.Handle // 0 once killed: a closed handle value can be reused by the OS
 	process windows.Handle
 	pid     int
 }
@@ -109,13 +111,27 @@ func (p *jobProc) Wait() (int, error) {
 	return int(code), nil
 }
 
+// Kill terminates every process in the job, then closes the job. It is
+// idempotent: a second call does nothing, so it can never act on a handle
+// value the OS has since reused for something else.
 func (p *jobProc) Kill() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.job == 0 {
+		return nil
+	}
 	err := windows.TerminateJobObject(p.job, 1)
 	windows.CloseHandle(p.job)
+	p.job = 0
 	return err
 }
 
 func (p *jobProc) Pids() ([]int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.job == 0 {
+		return nil, nil
+	}
 	// JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORDs then ULONG_PTR ids.
 	buf := make([]uintptr, 2+256)
 	if err := windows.QueryInformationJobObject(p.job, windows.JobObjectBasicProcessIdList,

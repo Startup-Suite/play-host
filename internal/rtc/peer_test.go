@@ -21,13 +21,16 @@ func TestOfferAnswerLoopbackDeliversInputEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, offer, err := NewPeer(api, cfg, track)
+	got := make(chan string, 1)
+	connected := make(chan struct{}, 1)
+	host, offer, err := NewPeer(api, cfg, track, Callbacks{
+		OnData:      func(label string, data []byte) { got <- label + ":" + string(data) },
+		OnConnected: func() { connected <- struct{}{} },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer host.Close()
-	got := make(chan string, 1)
-	host.OnData = func(label string, data []byte) { got <- label + ":" + string(data) }
 
 	se := webrtc.SettingEngine{}
 	se.SetIncludeLoopbackCandidate(true)
@@ -56,8 +59,17 @@ func TestOfferAnswerLoopbackDeliversInputEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-g
+	// A candidate trickled before the answer is queued, not an error.
+	if err := host.AddICECandidate(webrtc.ICECandidateInit{Candidate: ""}); err != nil {
+		t.Fatal(err)
+	}
 	if err := host.SetAnswer(viewer.LocalDescription().SDP); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-connected:
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnConnected never fired")
 	}
 	select {
 	case m := <-got:

@@ -1,11 +1,21 @@
 extends Node
-## Suite play addon (autoload). Inert unless Godot was started with the user arg
-## --suite-play-session=<id> after "--". Listens on 127.0.0.1:<--suite-play-port>
-## for exactly one connection from the play host, which carries:
-##   host -> game: newline-delimited JSON ({"t":"probe","seq":N}; stage 3 adds input)
-##   game -> host: frames when --suite-play-export=image|async (frame path C)
+## Suite play addon (autoload `SuitePlay`, task 01a0db5f). Inert unless Godot
+## was started with the user arg --suite-play-session=<id> after "--".
+##
+## Listens on 127.0.0.1:<--suite-play-port> for exactly one connection from
+## the play host, which carries:
+##   host -> game: newline-delimited JSON (see internal/input in play-host):
+##     {"t":"key","k":"W","loc":0,"p":true,"e":false}  k = Godot key name
+##     {"t":"jb","d":0,"b":0,"p":true,"v":1}          joypad button, device d
+##     {"t":"ja","d":0,"a":0,"v":-0.5}               joypad axis, device d
+##     {"t":"release_all"}  {"t":"probe","seq":N}  {"t":"export","on":true}
+##   game -> host: frames while export is on (frame path C, stage 1).
 ## Frame record (little-endian): "SPF1", u32 width, u32 height, u32 kind
 ## (1 = Image.FORMAT_RGBA8 from get_image, 2 = RD texture bytes), u32 length, bytes.
+##
+## All input goes through Input.parse_input_event: no ViGEm, no virtual
+## device driver. Mapping and edge-diffing are done by the host (Go, unit
+## tested); this file only resolves key names and builds the InputEvents.
 ##
 ## Probe marker: a 4x4 grid of 16x16 px cells in the top-left corner, row-major,
 ## MSB first, value = seq << 4 | check(seq), check = (s ^ s>>4 ^ s>>8 ^ 0xA) & 0xF.
@@ -18,7 +28,12 @@ const MAX_SEQ := 4095
 
 var session_id := ""
 var port := 0
-var export_mode := "none"
+## "image" | "async" | "none". The spike passed --suite-play-export and
+## exported always; the play host leaves it unset and switches export on and
+## off with {"t":"export"} so an unwatched game spends no GPU on readback.
+var export_mode := "image"
+var export_forced := false
+var exporting := false
 var _server := TCPServer.new()
 var _peer: StreamPeerTCP
 var _rx := PackedByteArray()
@@ -29,6 +44,12 @@ var _rd_tex := RID()
 var _async_inflight := 0
 var frames_sent := 0
 var probes_seen := 0
+var _keycodes := {}  # name -> Key
+var _held_keys := {}  # "keycode:loc" -> [keycode, loc]
+var _held_buttons := {}  # "d:b" -> [d, b]
+var _held_axes := {}  # "d:a" -> [d, a]
+var _checked_key := false
+var _checked_axis := false
 
 
 func _ready() -> void:
@@ -39,8 +60,10 @@ func _ready() -> void:
 			port = int(a.get_slice("=", 1))
 		elif a.begins_with("--suite-play-export="):
 			export_mode = a.get_slice("=", 1)
+			export_forced = export_mode != "none"
 		elif a.begins_with("--suite-play-fps="):
 			Engine.max_fps = int(a.get_slice("=", 1))
+	exporting = export_forced
 	if session_id == "" or port <= 0:
 		set_process(false)
 		return
@@ -96,7 +119,10 @@ func _process(_delta: float) -> void:
 		return
 	_peer.poll()
 	if _peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+		print("suite_play: host link closed; releasing input")
+		release_all()
 		_peer = null
+		exporting = export_forced
 		return
 	var n := _peer.get_available_bytes()
 	if n > 0:
@@ -109,16 +135,117 @@ func _process(_delta: float) -> void:
 			break
 		var line := _rx.slice(0, nl).get_string_from_utf8()
 		_rx = _rx.slice(nl + 1)
-		_handle(line)
+		handle_line(line)
 
 
-func _handle(line: String) -> void:
+## One host line. Public so the headless self-test can drive it.
+func handle_line(line: String) -> void:
 	var msg = JSON.parse_string(line)
 	if typeof(msg) != TYPE_DICTIONARY:
 		return
 	match str(msg.get("t", "")):
 		"probe":
 			show_probe(int(msg.get("seq", 0)))
+		"key":
+			_key(str(msg.get("k", "")), int(msg.get("loc", 0)), bool(msg.get("p", false)), bool(msg.get("e", false)))
+		"jb":
+			_joy_button(int(msg.get("d", 0)), int(msg.get("b", 0)), bool(msg.get("p", false)), float(msg.get("v", 0.0)))
+		"ja":
+			_joy_axis(int(msg.get("d", 0)), int(msg.get("a", 0)), float(msg.get("v", 0.0)))
+		"release_all":
+			release_all()
+		"export":
+			exporting = bool(msg.get("on", false)) or export_forced
+			print("suite_play: export %s" % exporting)
+
+
+## Key name (as OS.find_keycode_from_string reads it) -> Key, cached. 0 if unknown.
+## The host sends platform-neutral names; Godot spells META per platform
+## ("Windows" on Windows, "Command" on macOS), so it is special-cased here.
+## Measured on wave: without this, "Meta" resolved to KEY_NONE.
+func keycode_for(name: String) -> int:
+	if not _keycodes.has(name):
+		_keycodes[name] = KEY_META if name == "Meta" else OS.find_keycode_from_string(name)
+	return int(_keycodes[name])
+
+
+func _key(name: String, loc: int, pressed: bool, echo: bool) -> void:
+	var code := keycode_for(name)
+	if code == KEY_NONE:
+		return
+	var ev := InputEventKey.new()
+	ev.keycode = code
+	ev.physical_keycode = code
+	ev.location = loc
+	ev.pressed = pressed
+	ev.echo = echo
+	var id := "%d:%d" % [code, loc]
+	if pressed:
+		_held_keys[id] = [code, loc]
+	else:
+		_held_keys.erase(id)
+	Input.parse_input_event(ev)
+	if not _checked_key:
+		_checked_key = true
+		Input.flush_buffered_events()
+		print("suite_play: first key %s pressed=%s -> Input.is_physical_key_pressed=%s" % [name, pressed, Input.is_physical_key_pressed(code)])
+
+
+func _joy_button(device: int, button: int, pressed: bool, value: float) -> void:
+	var ev := InputEventJoypadButton.new()
+	ev.device = device
+	ev.button_index = button
+	ev.pressed = pressed
+	ev.pressure = value
+	var id := "%d:%d" % [device, button]
+	if pressed:
+		_held_buttons[id] = [device, button]
+	else:
+		_held_buttons.erase(id)
+	Input.parse_input_event(ev)
+
+
+func _joy_axis(device: int, axis: int, value: float) -> void:
+	var ev := InputEventJoypadMotion.new()
+	ev.device = device
+	ev.axis = axis
+	ev.axis_value = value
+	var id := "%d:%d" % [device, axis]
+	if absf(value) > 0.0:
+		_held_axes[id] = [device, axis]
+	else:
+		_held_axes.erase(id)
+	Input.parse_input_event(ev)
+	if not _checked_axis:
+		_checked_axis = true
+		Input.flush_buffered_events()
+		print("suite_play: first axis d%d a%d v=%.3f -> Input.get_joy_axis=%.3f" % [device, axis, value, Input.get_joy_axis(device, axis)])
+
+
+## Releases every key, button and axis this addon pressed.
+func release_all() -> void:
+	for k in _held_keys.values():
+		var ev := InputEventKey.new()
+		ev.keycode = k[0]
+		ev.physical_keycode = k[0]
+		ev.location = k[1]
+		ev.pressed = false
+		Input.parse_input_event(ev)
+	_held_keys.clear()
+	for b in _held_buttons.values():
+		var ev := InputEventJoypadButton.new()
+		ev.device = b[0]
+		ev.button_index = b[1]
+		ev.pressed = false
+		Input.parse_input_event(ev)
+	_held_buttons.clear()
+	for a in _held_axes.values():
+		var ev := InputEventJoypadMotion.new()
+		ev.device = a[0]
+		ev.axis = a[1]
+		ev.axis_value = 0.0
+		Input.parse_input_event(ev)
+	_held_axes.clear()
 
 
 func _on_frame_post_draw() -> void:
@@ -126,7 +253,7 @@ func _on_frame_post_draw() -> void:
 		_probe_left -= 1
 		if _probe_left == 0:
 			_clear_probe()
-	if _peer == null:
+	if _peer == null or not exporting:
 		return
 	match export_mode:
 		"image":

@@ -3,6 +3,7 @@ module github.com/Startup-Suite/play-host
 go 1.25.0
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/pion/ice/v4 v4.2.0
 	github.com/pion/rtcp v1.2.16
 	github.com/pion/rtp v1.10.1

@@ -34,17 +34,31 @@ const (
 	LabelInputEvents = "input-events" // reliable, ordered; key edges and probes
 )
 
+// Callbacks are fixed at NewPeer, before any pion goroutine can call them.
+type Callbacks struct {
+	OnPLI       func()
+	OnData      func(label string, data []byte)
+	OnConnected func()
+	// OnDone fires once: Failed, Closed, or Disconnected for longer than
+	// DisconnectGrace (ICE can recover from a short Disconnected).
+	OnDone func(reason string)
+}
+
+// DisconnectGrace is how long Disconnected may last before the peer is done.
+var DisconnectGrace = 5 * time.Second
+
 // Peer is one viewer connection.
 type Peer struct {
-	pc     *webrtc.PeerConnection
-	Track  webrtc.TrackLocal
-	OnPLI  func()
-	OnData func(label string, data []byte)
-	OnDone func(reason string)
+	pc    *webrtc.PeerConnection
+	Track webrtc.TrackLocal
+	cb    Callbacks
 
-	mu     sync.Mutex
-	closed bool
-	pli    int
+	mu        sync.Mutex
+	closed    bool
+	pli       int
+	remoteSet bool
+	queued    []webrtc.ICECandidateInit
+	dcTimer   *time.Timer
 }
 
 // NewAPI builds a pion API from cfg.
@@ -91,12 +105,12 @@ func NewVideoTrackSample() (*webrtc.TrackLocalStaticSample, error) {
 
 // NewPeer creates the connection, adds track and data channels, and returns
 // the complete (non-trickle) offer once ICE gathering finishes.
-func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal) (*Peer, string, error) {
+func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal, cb Callbacks) (*Peer, string, error) {
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: cfg.ICEServers})
 	if err != nil {
 		return nil, "", err
 	}
-	p := &Peer{pc: pc, Track: track}
+	p := &Peer{pc: pc, Track: track, cb: cb}
 	tr, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
 	if err != nil {
 		pc.Close()
@@ -119,14 +133,30 @@ func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal) (*Peer, strin
 		}
 		label := dc.label
 		ch.OnMessage(func(m webrtc.DataChannelMessage) {
-			if p.OnData != nil {
-				p.OnData(label, m.Data)
+			if p.cb.OnData != nil {
+				p.cb.OnData(label, m.Data)
 			}
 		})
 	}
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		switch s {
-		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateDisconnected:
+		case webrtc.PeerConnectionStateConnected:
+			p.mu.Lock()
+			if p.dcTimer != nil {
+				p.dcTimer.Stop()
+				p.dcTimer = nil
+			}
+			p.mu.Unlock()
+			if p.cb.OnConnected != nil {
+				p.cb.OnConnected()
+			}
+		case webrtc.PeerConnectionStateDisconnected:
+			p.mu.Lock()
+			if p.dcTimer == nil && !p.closed {
+				p.dcTimer = time.AfterFunc(DisconnectGrace, func() { p.finish("disconnected") })
+			}
+			p.mu.Unlock()
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			p.finish(s.String())
 		}
 	})
@@ -168,8 +198,8 @@ func (p *Peer) readRTCP(s *webrtc.RTPSender) {
 				p.mu.Lock()
 				p.pli++
 				p.mu.Unlock()
-				if p.OnPLI != nil {
-					p.OnPLI()
+				if p.cb.OnPLI != nil {
+					p.cb.OnPLI()
 				}
 			}
 		}
@@ -179,9 +209,36 @@ func (p *Peer) readRTCP(s *webrtc.RTPSender) {
 // PLICount is how many PLI/FIR the viewer sent.
 func (p *Peer) PLICount() int { p.mu.Lock(); defer p.mu.Unlock(); return p.pli }
 
-// SetAnswer applies the browser's answer.
+// SetAnswer applies the browser's answer, then any candidates that arrived
+// before it.
 func (p *Peer) SetAnswer(sdp string) error {
-	return p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp})
+	if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.remoteSet = true
+	q := p.queued
+	p.queued = nil
+	p.mu.Unlock()
+	for _, c := range q {
+		if err := p.pc.AddICECandidate(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AddICECandidate adds a trickled viewer candidate, queueing it until the
+// answer is set.
+func (p *Peer) AddICECandidate(c webrtc.ICECandidateInit) error {
+	p.mu.Lock()
+	if !p.remoteSet {
+		p.queued = append(p.queued, c)
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Unlock()
+	return p.pc.AddICECandidate(c)
 }
 
 // SelectedPair describes the nominated candidate pair ("host", "srflx", "relay").
@@ -210,8 +267,12 @@ func (p *Peer) finish(reason string) {
 		return
 	}
 	p.closed = true
+	if p.dcTimer != nil {
+		p.dcTimer.Stop()
+		p.dcTimer = nil
+	}
 	p.mu.Unlock()
-	if p.OnDone != nil {
-		p.OnDone(reason)
+	if p.cb.OnDone != nil {
+		p.cb.OnDone(reason)
 	}
 }

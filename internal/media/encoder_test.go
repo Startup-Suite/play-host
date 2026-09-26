@@ -41,7 +41,7 @@ func TestValidateRejects(t *testing.T) {
 		func(p *Preset) { p.Preset = "p8" },
 		func(p *Preset) { p.Tune = "hq" },
 		func(p *Preset) { p.BitrateKbps = 10 },
-		func(p *Preset) { p.Width = 1281 },
+		func(p *Preset) { p.Width = 10 },
 		func(p *Preset) { p.GOPFrames = 0 },
 		func(p *Preset) { p.FPS = 500 },
 	}
@@ -76,5 +76,30 @@ func TestCommandShapes(t *testing.T) {
 func TestLabel(t *testing.T) {
 	if got := DefaultPreset().Label(); got != "p4-ll-8000k-720p60-g120" {
 		t.Fatal(got)
+	}
+}
+
+func TestControlPresetMatchesCore(t *testing.T) {
+	// Core's GameStreamEncoder @control (stage 2) and stage 1's chosen arm.
+	want := Preset{Preset: "p1", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
+	if got := ControlPreset(); got != want {
+		t.Fatalf("control %+v, want %+v", got, want)
+	}
+	if err := want.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOddFramesAreCroppedEven(t *testing.T) {
+	if s := strings.Join(RawInputArgs("rgba", 1028, 720, 60), " "); strings.Contains(s, "-vf") {
+		t.Errorf("even frame must not add a filter: %s", s)
+	}
+	if got := argAfter(RawInputArgs("rgba", 1027, 719, 60), "-vf"); got != "crop=1026:718:0:0" {
+		t.Errorf("odd crop = %q", got)
+	}
+	odd := DefaultPreset()
+	odd.Width = 1281
+	if err := odd.Validate(); err != nil {
+		t.Errorf("odd window request must validate (core allows it): %v", err)
 	}
 }
