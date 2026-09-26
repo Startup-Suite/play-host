@@ -196,6 +196,8 @@ func (h *harness) startEncoder() error {
 	case "A":
 		input = media.DDAGrabInputArgs(o.Preset.FPS)
 	case "B":
+		// The scene sets the window title in its _ready, after the addon link is up.
+		time.Sleep(3 * time.Second)
 		input = media.GDIGrabInputArgs("suite-play-spike-01a0db5f", o.Preset.FPS)
 	case "C":
 		// Size comes from the first frame the addon exports.
@@ -408,11 +410,16 @@ func (h *harness) mux(cfg rtc.Config) http.Handler {
 }
 
 func (h *harness) cleanup() {
+	// Copy first: Close fires OnDone, which takes peersMu itself.
 	h.peersMu.Lock()
+	peers := make([]*rtc.Peer, 0, len(h.peers))
 	for _, p := range h.peers {
-		p.Close()
+		peers = append(peers, p)
 	}
 	h.peersMu.Unlock()
+	for _, p := range peers {
+		p.Close()
+	}
 	if h.ffIn != nil {
 		h.ffIn.Close()
 	}
