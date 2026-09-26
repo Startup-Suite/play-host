@@ -1,0 +1,16 @@
+play-host
+Copyright 2026 Startup Suite
+
+This product includes code ported from cloud-game / cloudplay
+(module github.com/giongto35/cloud-game/v3), licensed under the Apache
+License, Version 2.0. The full licence text is in
+third_party/cloud-game/LICENSE. Upstream ships no NOTICE file of its own.
+
+Ported, with modifications:
+  - internal/rtc/peer.go: the RTCP read loop that turns PLI/FIR into an
+    OnPLI callback (cloudplay pkg/network/webrtc/webrtc.go:51-75).
+  - internal/media/encoder.go: the h264_nvenc option defaults (CBR,
+    rc buffer about two frames, zerolatency, no lookahead, forced IDR,
+    baseline, preset p4 / tune ll) from cloudplay
+    pkg/encoder/nvenc/nvenc.go:70-99, re-expressed as ffmpeg CLI arguments.
+    Source revision: cloudplay b5aae1870a923d11d312eb345bc14c444209450f.

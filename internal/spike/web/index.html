@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>play-host spike 01a0db5f</title>
+<body style="background:#000;margin:0">
+<script src="probe.js"></script>
+<script>
+  // Manual use: open this page through the signalling tunnel and click.
+  document.body.addEventListener('click', async () => {
+    const o = await (await fetch('offer', { method: 'POST' })).json();
+    const sdp = await window.spike.start(o.sdp);
+    await fetch('answer', { method: 'POST', body: JSON.stringify({ ID: o.id, SDP: sdp }) });
+  }, { once: true });
+</script>

@@ -1,0 +1,4 @@
+/play-host.exe
+/bin/
+*.log
+.godot/
