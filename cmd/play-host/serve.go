@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/Startup-Suite/play-host/internal/build"
@@ -99,19 +100,17 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(c.LogsDir, 0o755); err != nil {
-		return err
-	}
-	lf, err := os.OpenFile(filepath.Join(c.LogsDir, "play-host.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	lf, err := setupLogging(c.LogsDir)
 	if err != nil {
 		return err
 	}
 	defer lf.Close()
-	log.SetOutput(io.MultiWriter(os.Stderr, lf))
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
+	defer logPanic()
 	log.Printf("play-host %s serve: runtime %s via %s", Version, c.RuntimeID, c.SuiteURL)
 
-	h := host.New(c.hostConfig(), nil, nil, log.Printf)
+	hc := c.hostConfig()
+	hc.PionLog = log.Writer()
+	h := host.New(hc, nil, nil, log.Printf)
 	cl := suite.New(suite.Config{URL: c.SuiteURL, RuntimeID: c.RuntimeID, TokenFile: c.TokenFile, Product: "play-host",
 		Version: Version, Heartbeat: time.Duration(c.HeartbeatS) * time.Second}, h)
 	h.SetSender(cl)
@@ -123,6 +122,40 @@ func serve(args []string) error {
 		time.Sleep(2 * time.Second)
 	}
 	return nil
+}
+
+// setupLogging opens <logs>/play-host.log for the standard logger AND for
+// the Go runtime's crash output (stage 6). The scheduled task that runs
+// play-host does not redirect stderr, so before this an unrecovered panic
+// on any goroutine killed the process (exit code 2) with its message and
+// stack written nowhere. debug.SetCrashOutput makes the runtime copy every
+// fatal panic, with all goroutine stacks, into the log file as well.
+func setupLogging(dir string) (*os.File, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	lf, err := os.OpenFile(filepath.Join(dir, "play-host.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, lf))
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
+	if err := debug.SetCrashOutput(lf, debug.CrashOptions{}); err != nil {
+		log.Printf("play-host: crash output not redirected: %v", err)
+	}
+	return lf, nil
+}
+
+// logPanic is the main goroutine's deferred recover: it logs the panic and
+// its stack, then exits 2 as an unrecovered panic would, so the scheduled
+// task still sees a failure. Panics on other goroutines are covered by
+// SetCrashOutput (and the session's own guards turn most of them into a
+// failed session instead).
+func logPanic() {
+	if r := recover(); r != nil {
+		log.Printf("play-host: PANIC: %v\n%s", r, debug.Stack())
+		os.Exit(2)
+	}
 }
 
 func keynames() error {

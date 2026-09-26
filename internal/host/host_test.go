@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -165,6 +166,9 @@ type fakeStages struct {
 	prepared chan struct{}
 	block    chan struct{} // if non-nil, Prepare waits on it
 	headErr  error
+	mu       sync.Mutex
+	dir      string
+	removed  []string
 }
 
 func (f *fakeStages) Prepare(ctx context.Context, s protocol.SessionStart, progress func(string)) (string, error) {
@@ -177,9 +181,25 @@ func (f *fakeStages) Prepare(ctx context.Context, s protocol.SessionStart, progr
 		}
 	}
 	close(f.prepared)
-	return f.t.TempDir(), nil
+	dir := filepath.Join(f.t.TempDir(), "checkout")
+	os.MkdirAll(dir, 0o755)
+	f.mu.Lock()
+	f.dir = dir
+	f.mu.Unlock()
+	return dir, nil
 }
 func (f *fakeStages) AssertHead(ctx context.Context, dir, sha string) error { return f.headErr }
+func (f *fakeStages) Remove(ctx context.Context, s protocol.SessionStart, dir string) error {
+	f.mu.Lock()
+	f.removed = append(f.removed, dir)
+	f.mu.Unlock()
+	return os.RemoveAll(dir)
+}
+func (f *fakeStages) removedDirs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.removed...)
+}
 func (f *fakeStages) Launch(dir string, s protocol.SessionStart, logPath string) (launch.Proc, error) {
 	f.game = startFakeGame(f.t, f.port)
 	return &fakeProc{g: f.game}, nil

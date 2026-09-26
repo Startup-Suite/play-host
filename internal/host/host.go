@@ -13,9 +13,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +32,9 @@ import (
 	"github.com/Startup-Suite/play-host/internal/rtc"
 	"github.com/pion/webrtc/v4"
 )
+
+// newPeerGather is rtc.NewPeerGather; tests swap it to make offers fail.
+var newPeerGather = rtc.NewPeerGather
 
 // Config is everything the engine needs about the machine.
 type Config struct {
@@ -48,6 +53,14 @@ type Config struct {
 	IdleCheck     time.Duration // how often the idle timer is evaluated (1 s)
 	SkipImport    bool          // tests
 	Loopback      bool          // tests: offer 127.0.0.1 candidates
+	// OfferAttempts bounds how many times one offer is tried before the
+	// session fails (0 = 3); OfferBackoff is the wait before the first retry,
+	// doubled each time (0 = 500 ms). Stage 6: one failed re-offer after a
+	// viewer change used to end a live session.
+	OfferAttempts int
+	OfferBackoff  time.Duration
+	// PionLog receives pion's ICE warnings and errors (play-host.log on wave).
+	PionLog io.Writer
 }
 
 // Sender pushes host -> core frames.
@@ -63,6 +76,11 @@ type Stages interface {
 	AssertHead(ctx context.Context, dir, sha string) error
 	// Launch starts Godot for dir.
 	Launch(dir string, s protocol.SessionStart, logPath string) (launch.Proc, error)
+	// Remove deletes the session's checkout once Godot is gone (the bare
+	// mirror stays, so the next build of the same repo is still a local
+	// worktree add). Stage 6: the review clause is that an ended session's
+	// checkout is cleaned up.
+	Remove(ctx context.Context, s protocol.SessionStart, dir string) error
 }
 
 // Host is the engine. It implements suite.Handler.
@@ -92,6 +110,12 @@ func New(cfg Config, send Sender, stages Stages, logf func(string, ...any)) *Hos
 	}
 	if cfg.ImportTimeout == 0 {
 		cfg.ImportTimeout = 20 * time.Minute
+	}
+	if cfg.OfferAttempts <= 0 {
+		cfg.OfferAttempts = 3
+	}
+	if cfg.OfferBackoff <= 0 {
+		cfg.OfferBackoff = 500 * time.Millisecond
 	}
 	h := &Host{cfg: cfg, send: send, logf: logf}
 	if stages == nil {
@@ -189,13 +213,38 @@ func (h *Host) start(payload json.RawMessage) {
 	h.cur = s
 	h.mu.Unlock()
 	go func() {
+		defer func() {
+			// The session goroutine already fails itself on a panic (run's
+			// recoverPanic); this is for a panic in its cleanup. Either way
+			// the host stays up and free for the next session.
+			if r := recover(); r != nil {
+				h.logf("host: PANIC in session %s cleanup: %v\n%s", st.SessionID, r, debug.Stack())
+			}
+			h.mu.Lock()
+			if h.cur == s {
+				h.cur = nil
+			}
+			h.mu.Unlock()
+		}()
 		s.run()
-		h.mu.Lock()
-		if h.cur == s {
-			h.cur = nil
-		}
-		h.mu.Unlock()
 	}()
+}
+
+// guard runs f, turning a panic into a logged session failure instead of a
+// process exit. Every goroutine the session starts, and every callback pion
+// runs on its own goroutines, goes through it (stage 6: an unrecovered
+// panic in a pion callback killed play-host.exe with exit code 2 and
+// nothing in the log).
+func (s *Session) guard(where string, f func()) {
+	defer s.recoverPanic(where)
+	f()
+}
+
+func (s *Session) recoverPanic(where string) {
+	if r := recover(); r != nil {
+		s.logf("PANIC in %s: %v\n%s", where, r, debug.Stack())
+		s.fail(fmt.Sprintf("The play host hit an internal error (%s); see play-host.log", where))
+	}
 }
 
 // Session is one play session.
@@ -213,6 +262,7 @@ type Session struct {
 	report   bool // send the terminal status (false when the socket is gone)
 
 	lastInput atomic.Int64 // unix nanos
+	dir       string       // the checkout, removed at the end
 	godot     launch.Proc
 	link      *link.Link
 	api       *webrtc.API
@@ -321,13 +371,14 @@ func (s *Session) applySignal(sig protocol.Signal) {
 
 func (s *Session) run() {
 	defer s.cleanup()
+	defer s.recoverPanic("session")
 	s.status(protocol.StateBuilding, fmt.Sprintf("Preparing %s at %s", s.start.Branch, s.start.SHA[:12]))
 
 	// Progress reporter: building with elapsed_ms every ProgressEvery.
 	var detail atomic.Value
 	detail.Store("Preparing")
 	progCtx, progStop := context.WithCancel(s.ctx)
-	go func() {
+	go s.guard("progress", func() {
 		t := time.NewTicker(s.h.cfg.ProgressEvery)
 		defer t.Stop()
 		for {
@@ -338,8 +389,11 @@ func (s *Session) run() {
 				s.status(protocol.StateBuilding, detail.Load().(string))
 			}
 		}
-	}()
+	})
 	dir, err := s.h.stages.Prepare(s.ctx, s.start, func(d string) { detail.Store(d) })
+	if dir != "" {
+		s.dir = dir
+	}
 	if err != nil {
 		progStop()
 		s.fail("build: " + err.Error())
@@ -362,19 +416,19 @@ func (s *Session) run() {
 	pids, _ := p.Pids()
 	s.logf("godot pid %d job %v dir %s", p.Pid(), pids, dir)
 	exited := make(chan int, 1)
-	go func() {
+	go s.guard("godot wait", func() {
 		code, _ := p.Wait()
 		exited <- code
-	}()
+	})
 	var gone atomic.Bool
-	go func() {
+	go s.guard("godot watch", func() {
 		select {
 		case code := <-exited:
 			gone.Store(true)
 			s.fail(fmt.Sprintf("The game exited (code %d); see %s", code, filepath.Base(godotLog)))
 		case <-s.ctx.Done():
 		}
-	}()
+	})
 	l, err := link.Dial(s.h.cfg.GodotPort, s.h.cfg.LinkTimeout, func() bool { return !gone.Load() && s.ctx.Err() == nil })
 	progStop()
 	if err != nil {
@@ -386,9 +440,9 @@ func (s *Session) run() {
 		s.fail("webrtc: " + err.Error())
 		return
 	}
-	go s.readFrames()
+	go s.guard("frames", s.readFrames)
 
-	if err := s.newPeer(); err != nil {
+	if err := s.offer(); err != nil {
 		s.fail("webrtc: " + err.Error())
 		return
 	}
@@ -413,7 +467,7 @@ func (s *Session) run() {
 // setupMedia builds the pion API, the one video track and the encoder
 // pipeline; they outlive viewer reconnects.
 func (s *Session) setupMedia() error {
-	cfg := rtc.Config{PortMin: s.h.cfg.UDPMin, PortMax: s.h.cfg.UDPMax, ICEServers: ICEServers(s.start.ICEServers), IncludeLoopback: s.h.cfg.Loopback}
+	cfg := rtc.Config{PortMin: s.h.cfg.UDPMin, PortMax: s.h.cfg.UDPMax, ICEServers: ICEServers(s.start.ICEServers), IncludeLoopback: s.h.cfg.Loopback, LogWriter: s.h.cfg.PionLog}
 	if s.h.cfg.HostIP != "" {
 		cfg.AllowIPs = []net.IP{net.ParseIP(s.h.cfg.HostIP)}
 	}
@@ -439,20 +493,55 @@ func (s *Session) post(f func()) {
 	}
 }
 
+// offer publishes a fresh viewer offer, retrying a failed attempt (bounded,
+// with backoff) before giving up on the session. Stage 6: a re-offer after a
+// viewer change once timed out gathering and ended a live session; one
+// failed attempt is now a log line.
+func (s *Session) offer() error {
+	var err error
+	wait := s.h.cfg.OfferBackoff
+	for attempt := 1; attempt <= s.h.cfg.OfferAttempts; attempt++ {
+		if err = s.newPeer(); err == nil {
+			return nil
+		}
+		if s.ctx.Err() != nil {
+			return err
+		}
+		s.logf("offer attempt %d/%d failed: %v", attempt, s.h.cfg.OfferAttempts, err)
+		if attempt == s.h.cfg.OfferAttempts {
+			break
+		}
+		select {
+		case <-time.After(wait):
+		case <-s.ctx.Done():
+			return err
+		}
+		wait *= 2
+	}
+	return err
+}
+
 // newPeer creates a fresh viewer connection and publishes its offer.
 func (s *Session) newPeer() error {
 	s.trMu.Lock()
 	s.tr = input.NewTranslator()
 	s.trMu.Unlock()
 	var peer *rtc.Peer
-	p, offer, err := rtc.NewPeer(s.api, s.rtcCfg, s.track, rtc.Callbacks{
+	// A callback from a peer that never became s.peer (its NewPeer failed and
+	// closed it) must do nothing: `peer` is still nil then, and so may
+	// s.peer be. Stage 6: that nil == nil case ran viewerGone on a nil peer
+	// and panicked the process.
+	mine := func() bool { return peer != nil && s.peer == peer }
+	p, offer, g, err := newPeerGather(s.api, s.rtcCfg, s.track, rtc.Callbacks{
 		OnPLI: func() {
 			s.logf("PLI/FIR from viewer: no forced IDR in the subprocess encoder; next IDR within GOP %d", s.start.Encoder.GOPFrames)
 		},
-		OnData: func(label string, data []byte) { s.onInput(label, data) },
+		OnData: func(label string, data []byte) {
+			s.guard("input", func() { s.onInput(label, data) })
+		},
 		OnConnected: func() {
 			s.post(func() {
-				if s.peer != peer {
+				if !mine() {
 					return
 				}
 				s.logf("viewer connected: %s", peer.SelectedPair())
@@ -461,7 +550,7 @@ func (s *Session) newPeer() error {
 		},
 		OnDone: func(reason string) {
 			s.post(func() {
-				if s.peer != peer {
+				if !mine() {
 					return
 				}
 				s.logf("viewer gone: %s", reason)
@@ -472,6 +561,7 @@ func (s *Session) newPeer() error {
 	if err != nil {
 		return err
 	}
+	s.logf("offer: %s", g)
 	peer = p
 	s.peer = p
 	sig, err := protocol.NewOfferSignal(s.ID(), offer)
@@ -484,17 +574,24 @@ func (s *Session) newPeer() error {
 	return nil
 }
 
+// viewerGone runs on the session loop when the current peer ends. The old
+// peer is closed BEFORE the next one is created, so its UDP port in the
+// 10-port range and its TURN allocation are released first (it used to be
+// closed on a goroutine, racing the new peer's gathering).
 func (s *Session) viewerGone() {
+	old := s.peer
+	if old == nil {
+		return
+	}
+	s.peer = nil
 	s.setExport(false)
 	s.enc.Stop()
 	s.releaseAll()
-	old := s.peer
-	s.peer = nil
-	go old.Close()
+	old.Close()
 	if s.ctx.Err() != nil {
 		return
 	}
-	if err := s.newPeer(); err != nil {
+	if err := s.offer(); err != nil {
 		s.fail("webrtc: " + err.Error())
 	}
 }
@@ -578,9 +675,8 @@ func (s *Session) readFrames() {
 }
 
 func (s *Session) cleanup() {
-	if s.peer != nil {
-		s.peer.Close()
-	}
+	s.peer.Close() // nil-safe
+	s.peer = nil
 	if s.enc != nil {
 		s.enc.Stop()
 	}
@@ -592,6 +688,13 @@ func (s *Session) cleanup() {
 		pids, _ := s.godot.Pids()
 		err := s.godot.Kill()
 		s.logf("killed godot job pids=%v err=%v", pids, err)
+	}
+	if s.dir != "" {
+		t0 := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err := s.h.stages.Remove(ctx, s.start, s.dir)
+		cancel()
+		s.logf("removed checkout %s in %s err=%v", s.dir, time.Since(t0).Round(time.Millisecond), err)
 	}
 	s.mu.Lock()
 	state, why, report := s.endState, s.endWhy, s.report
@@ -653,6 +756,16 @@ func (r *realStages) Prepare(ctx context.Context, st protocol.SessionStart, prog
 		progress(fmt.Sprintf("Importing assets (%ds)", int(el.Seconds())))
 	})
 	return dir, err
+}
+
+func (r *realStages) Remove(ctx context.Context, st protocol.SessionStart, dir string) error {
+	cfg := r.h.cfg
+	repo, err := cfg.Build.FindRepo(st.RepoURL)
+	if err != nil {
+		return err
+	}
+	b := &build.Builder{Cfg: cfg.Build, Logf: r.h.logf}
+	return b.RemoveCheckout(ctx, cfg.Build.MirrorDir(repo), dir)
 }
 
 func (r *realStages) AssertHead(ctx context.Context, dir, sha string) error {

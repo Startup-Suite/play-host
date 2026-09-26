@@ -233,3 +233,62 @@ func TestImportArgsCarryMarker(t *testing.T) {
 		t.Fatal(a)
 	}
 }
+
+// TestRemoveCheckout (stage 6): an ended session's checkout is removed from
+// disk AND from the mirror's worktree list, the mirror survives, the same
+// sha checks out again afterwards, and nothing outside CheckoutsDir can be
+// removed through it.
+func TestRemoveCheckout(t *testing.T) {
+	git := testGit(t)
+	root := t.TempDir()
+	up := filepath.Join(root, "upstream")
+	os.MkdirAll(up, 0o755)
+	run(t, git, up, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(up, "project.godot"), []byte(voltronProject), 0o644)
+	run(t, git, up, "add", ".")
+	run(t, git, up, "commit", "-q", "-m", "one")
+	sha := run(t, git, up, "rev-parse", "HEAD")
+	b := &Builder{Cfg: Config{
+		Git: git, MirrorsDir: filepath.Join(root, "mirrors"), CheckoutsDir: filepath.Join(root, "checkouts"),
+		Repos: []Repo{{Match: "github.com/o/voltron", CloneURL: up}},
+	}}
+	r, _ := b.Cfg.FindRepo("https://github.com/o/voltron")
+	ctx := context.Background()
+	mirror, err := b.EnsureCommit(ctx, r, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, _ := CheckoutDir(b.Cfg.CheckoutsDir, "01a0db5f", sha)
+	if err := b.Checkout(ctx, r, mirror, dir, sha); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(dir, ".godot", "imported"), 0o755) // an import cache
+	os.WriteFile(filepath.Join(dir, ".godot", "imported", "x.ctex"), []byte("x"), 0o644)
+
+	if err := b.RemoveCheckout(ctx, mirror, dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("checkout still on disk: %v", err)
+	}
+	if list := run(t, git, mirror, "worktree", "list"); strings.Contains(list, filepath.Base(dir)) {
+		t.Fatalf("mirror still lists the worktree:\n%s", list)
+	}
+	if _, err := os.Stat(mirror); err != nil {
+		t.Fatalf("the mirror was removed too: %v", err)
+	}
+	// The next session of the same sha builds again from the kept mirror.
+	if err := b.Checkout(ctx, r, mirror, dir, sha); err != nil {
+		t.Fatal(err)
+	}
+	// Refused: CheckoutsDir itself, a path outside it, a nested path.
+	outside := filepath.Join(root, "upstream")
+	for _, bad := range []string{b.Cfg.CheckoutsDir, outside, filepath.Join(dir, "addons")} {
+		if err := b.RemoveCheckout(ctx, mirror, bad); err == nil {
+			t.Errorf("RemoveCheckout(%s) was allowed", bad)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(outside, "project.godot")); err != nil {
+		t.Fatal("a refused remove deleted something")
+	}
+}

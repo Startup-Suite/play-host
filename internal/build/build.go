@@ -243,6 +243,46 @@ func (b *Builder) AssertHead(ctx context.Context, dir, sha string) error {
 	return nil
 }
 
+// RemoveCheckout deletes one session checkout at the end of its session:
+// `git worktree remove --force` on the bare mirror, then the directory
+// itself (retried for a few seconds, because on Windows a Godot that was
+// just terminated can hold its files open briefly), then `worktree prune`.
+// The mirror is kept, so the next build of any sha in the repo is a local
+// worktree add plus an asset import. dir must lie inside CheckoutsDir.
+func (b *Builder) RemoveCheckout(ctx context.Context, mirror, dir string) error {
+	root, err := filepath.Abs(b.Cfg.CheckoutsDir)
+	if err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	if rel, err := filepath.Rel(root, abs); err != nil || rel == "." || strings.HasPrefix(rel, "..") || strings.ContainsAny(rel, `/\`) {
+		return fmt.Errorf("refusing to remove %s: not a checkout directly under %s", dir, root)
+	}
+	_, _ = b.git(ctx, nil, "-C", mirror, "worktree", "remove", "--force", abs)
+	var rmErr error
+	for i := 0; i < 20; i++ {
+		if rmErr = os.RemoveAll(abs); rmErr == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	_, _ = b.git(ctx, nil, "-C", mirror, "worktree", "prune")
+	if rmErr != nil {
+		return fmt.Errorf("remove checkout: %w", rmErr)
+	}
+	if _, err := os.Stat(abs); err == nil {
+		return fmt.Errorf("remove checkout: %s still exists", abs)
+	}
+	return nil
+}
+
 // Prune removes all but the newest keep checkouts (never `except`).
 func (b *Builder) Prune(ctx context.Context, mirror, except string) {
 	keep := b.Cfg.KeepCheckouts
