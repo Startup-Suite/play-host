@@ -292,3 +292,47 @@ func TestRemoveCheckout(t *testing.T) {
 		t.Fatal("a refused remove deleted something")
 	}
 }
+
+// TestSweepCheckouts (stage 6): at host start every checkout under
+// CheckoutsDir is removed, mirror-owned or not, and the mirror is kept.
+func TestSweepCheckouts(t *testing.T) {
+	git := testGit(t)
+	root := t.TempDir()
+	up := filepath.Join(root, "upstream")
+	os.MkdirAll(up, 0o755)
+	run(t, git, up, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(up, "project.godot"), []byte(voltronProject), 0o644)
+	run(t, git, up, "add", ".")
+	run(t, git, up, "commit", "-q", "-m", "one")
+	sha := run(t, git, up, "rev-parse", "HEAD")
+	b := &Builder{Cfg: Config{
+		Git: git, MirrorsDir: filepath.Join(root, "mirrors"), CheckoutsDir: filepath.Join(root, "checkouts"),
+		Repos: []Repo{{Match: "github.com/o/voltron", CloneURL: up}},
+	}}
+	r, _ := b.Cfg.FindRepo("https://github.com/o/voltron")
+	ctx := context.Background()
+	mirror, _ := b.EnsureCommit(ctx, r, sha)
+	dir, _ := CheckoutDir(b.Cfg.CheckoutsDir, "01a0dcc3", sha)
+	if err := b.Checkout(ctx, r, mirror, dir, sha); err != nil {
+		t.Fatal(err)
+	}
+	stray := filepath.Join(b.Cfg.CheckoutsDir, "stray-dir")
+	os.MkdirAll(stray, 0o755)
+	removed, err := b.SweepCheckouts(ctx)
+	if len(removed) != 2 {
+		t.Fatalf("removed %v err %v", removed, err)
+	}
+	if ents, _ := os.ReadDir(b.Cfg.CheckoutsDir); len(ents) != 0 {
+		t.Fatalf("left %v", ents)
+	}
+	if list := run(t, git, mirror, "worktree", "list"); strings.Contains(list, filepath.Base(dir)) {
+		t.Fatalf("mirror still lists it:\n%s", list)
+	}
+	if err := b.Checkout(ctx, r, mirror, dir, sha); err != nil {
+		t.Fatalf("mirror unusable after the sweep: %v", err)
+	}
+	b2 := &Builder{Cfg: Config{Git: git, CheckoutsDir: filepath.Join(root, "missing")}}
+	if got, err := b2.SweepCheckouts(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("missing dir: %v %v", got, err)
+	}
+}

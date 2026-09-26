@@ -283,6 +283,54 @@ func (b *Builder) RemoveCheckout(ctx context.Context, mirror, dir string) error 
 	return nil
 }
 
+// SweepCheckouts removes every checkout under CheckoutsDir. It runs when the
+// host starts, when no session can be using one (one session per host, and
+// the host has just started): a session whose host was killed or crashed
+// never reached its own RemoveCheckout, and this is where its checkout goes.
+// The bare mirrors are kept. It returns the directories it removed.
+func (b *Builder) SweepCheckouts(ctx context.Context) ([]string, error) {
+	ents, err := os.ReadDir(b.Cfg.CheckoutsDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var mirrors []string
+	for _, r := range b.Cfg.Repos {
+		if m := b.Cfg.MirrorDir(r); m != "" {
+			if _, err := os.Stat(m); err == nil {
+				mirrors = append(mirrors, m)
+			}
+		}
+	}
+	var removed []string
+	var firstErr error
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(b.Cfg.CheckoutsDir, e.Name())
+		var err error
+		if len(mirrors) == 0 {
+			err = os.RemoveAll(dir)
+		}
+		for _, m := range mirrors {
+			// Only the mirror that owns the worktree acts on remove; for the
+			// others it is a harmless error, and RemoveCheckout still deletes
+			// the directory.
+			err = b.RemoveCheckout(ctx, m, dir)
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if _, statErr := os.Stat(dir); statErr != nil {
+			removed = append(removed, dir)
+		}
+	}
+	return removed, firstErr
+}
+
 // Prune removes all but the newest keep checkouts (never `except`).
 func (b *Builder) Prune(ctx context.Context, mirror, except string) {
 	keep := b.Cfg.KeepCheckouts

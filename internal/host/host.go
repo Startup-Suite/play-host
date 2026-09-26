@@ -136,6 +136,16 @@ func (h *Host) Current() *Session {
 	return h.cur
 }
 
+// SweepCheckouts removes checkouts left by a session that never ended
+// cleanly (the host was killed or crashed). Call it once at start, before
+// any session can run.
+func (h *Host) SweepCheckouts(ctx context.Context) {
+	removed, err := (&build.Builder{Cfg: h.cfg.Build, Logf: h.logf}).SweepCheckouts(ctx)
+	if len(removed) > 0 || err != nil {
+		h.logf("host: removed %d checkout(s) left by an earlier run: %v err=%v", len(removed), removed, err)
+	}
+}
+
 // OnConnected implements suite.Handler.
 func (h *Host) OnConnected() { h.logf("host: joined; ready for play_session_start") }
 

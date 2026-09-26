@@ -111,6 +111,9 @@ func serve(args []string) error {
 	hc := c.hostConfig()
 	hc.PionLog = log.Writer()
 	h := host.New(hc, nil, nil, log.Printf)
+	sweepCtx, sweepDone := context.WithTimeout(context.Background(), 2*time.Minute)
+	h.SweepCheckouts(sweepCtx)
+	sweepDone()
 	cl := suite.New(suite.Config{URL: c.SuiteURL, RuntimeID: c.RuntimeID, TokenFile: c.TokenFile, Product: "play-host",
 		Version: Version, Heartbeat: time.Duration(c.HeartbeatS) * time.Second}, h)
 	h.SetSender(cl)
