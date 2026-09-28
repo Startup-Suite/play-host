@@ -2,8 +2,10 @@
 // runtime websocket: `wss://<host>/runtime/ws` authenticated with
 // runtime_id + token (PlatformWeb.RuntimeSocket.connect/3), joining
 // `runtime:<runtime_id>` (PlatformWeb.RuntimeChannel.join/3) with
-// client_info.features = ["game_stream_host"], the declaration
-// Platform.GameStream discovers hosts by.
+// client_info.features = ["game_stream_host", "game_stream_multi"]: the first
+// is the declaration Platform.GameStream discovers hosts by, the second tells
+// core this host speaks the multi-peer frames (task 01a0dbd6: play_peer_open,
+// play_peer_close, play_slots, play_slot_activity, peer_id on play_signal).
 //
 // Frames are v2 arrays: [join_ref, ref, topic, event, payload]. The client
 // heartbeats on the "phoenix" topic, treats a missed heartbeat reply as a
@@ -33,6 +35,11 @@ import (
 
 // Feature is the client_info.features entry that marks a play host.
 const Feature = "game_stream_host"
+
+// FeatureMulti declares the multi-peer frames (core Protocol.multi_feature/0).
+// Core sends play_peer_open, play_peer_close and play_slots only to a host
+// that declares it, and otherwise keeps v1 single-peer wiring.
+const FeatureMulti = "game_stream_multi"
 
 // Handler receives broadcasts pushed on the runtime topic.
 type Handler interface {
@@ -138,7 +145,7 @@ func ReadToken(path string) (string, error) {
 func (c *Client) JoinPayload() map[string]any {
 	ci := map[string]any{
 		"product":    c.cfg.Product,
-		"features":   []string{Feature},
+		"features":   []string{Feature, FeatureMulti},
 		"started_at": c.started.Format(time.RFC3339),
 	}
 	if c.cfg.Version != "" {

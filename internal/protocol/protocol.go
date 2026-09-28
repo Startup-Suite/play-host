@@ -13,8 +13,23 @@
 //	play_session_status {session_id, state: building|connecting|live|ended|failed, detail, elapsed_ms}
 //	play_signal         {session_id, kind: offer|ice, data}
 //
-// Unknown keys are ignored in both directions (the multi-player follow-on,
-// task 01a0dbd6, widens play_signal with an optional slot key).
+// Unknown keys are ignored in both directions.
+//
+// Widening (task 01a0dbd6, core protocol.ex "Widening: peers, player slots
+// and spectators"). A host that declares client_info.features
+// "game_stream_multi" (internal/suite) is sent, and sends:
+//
+//	core -> host  play_signal        + optional peer_id (the peer that answered)
+//	core -> host  play_peer_open     {session_id, peer_id}   create or REPLACE, then offer
+//	core -> host  play_peer_close    {session_id, peer_id}   close, release its slots
+//	core -> host  play_slots         {session_id, max_players, peers: {peer_id: {src: slot}}}
+//	host -> core  play_signal        + peer_id on every offer/ice
+//	host -> core  play_slot_activity {session_id, slots: [slot]}  at most 4 per second
+//
+// A peer is one WebRTC connection (one LiveView); a peer with no slots is a
+// spectator. play_slots is a FULL snapshot; JSON carries src and the peer map
+// keys as strings. An old core sends none of these and no peer_id, and the
+// host keeps v1: one implicit peer whose src 0 is slot 0.
 package protocol
 
 import (
@@ -22,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"unicode/utf8"
 
 	"github.com/Startup-Suite/play-host/internal/media"
@@ -33,6 +49,10 @@ const (
 	EventSessionStop   = "play_session_stop"
 	EventSignal        = "play_signal"
 	EventSessionStatus = "play_session_status"
+	EventPeerOpen      = "play_peer_open"
+	EventPeerClose     = "play_peer_close"
+	EventSlots         = "play_slots"
+	EventSlotActivity  = "play_slot_activity"
 )
 
 // Session states, in order. Ended and failed are terminal.
@@ -139,6 +159,50 @@ type Signal struct {
 	SessionID string          `json:"session_id"`
 	Kind      string          `json:"kind"`
 	Data      json.RawMessage `json:"data"`
+	// PeerID names the peer (multi-peer core); empty is the v1 single peer,
+	// and is then left off the wire.
+	PeerID string `json:"peer_id,omitempty"`
+}
+
+// PeerRef is play_peer_open and play_peer_close.
+type PeerRef struct {
+	SessionID string `json:"session_id"`
+	PeerID    string `json:"peer_id"`
+}
+
+// Slots is play_slots: a full, idempotent snapshot of every attached peer
+// (spectators with an empty map). Peers is peer_id -> src -> slot, with src
+// a string on the wire (a JSON object key).
+type Slots struct {
+	SessionID  string                    `json:"session_id"`
+	MaxPlayers int                       `json:"max_players"`
+	Peers      map[string]map[string]int `json:"peers"`
+}
+
+// Table converts the snapshot to peer_id -> src -> slot. An entry whose src
+// is not a non-negative integer, or whose slot is negative, is dropped: the
+// table is the only thing input is bound by, so a malformed entry must bind
+// nothing rather than guess.
+func (s Slots) Table() map[string]map[int]int {
+	out := make(map[string]map[int]int, len(s.Peers))
+	for peer, m := range s.Peers {
+		t := make(map[int]int, len(m))
+		for k, slot := range m {
+			src, err := strconv.Atoi(k)
+			if err != nil || src < 0 || slot < 0 {
+				continue
+			}
+			t[src] = slot
+		}
+		out[peer] = t
+	}
+	return out
+}
+
+// SlotActivity is play_slot_activity.
+type SlotActivity struct {
+	SessionID string `json:"session_id"`
+	Slots     []int  `json:"slots"`
 }
 
 // SessionDescription is the data of an offer or answer: an
@@ -188,8 +252,8 @@ func (s Signal) Candidate() (c ICECandidate, ok bool, err error) {
 	return c, c.Candidate != "", nil
 }
 
-// NewOfferSignal builds the host's offer.
-func NewOfferSignal(sessionID, sdp string) (Signal, error) {
+// NewOfferSignal builds the host's offer. peerID is empty for the v1 peer.
+func NewOfferSignal(sessionID, peerID, sdp string) (Signal, error) {
 	data, err := json.Marshal(SessionDescription{Type: KindOffer, SDP: sdp})
 	if err != nil {
 		return Signal{}, err
@@ -197,7 +261,7 @@ func NewOfferSignal(sessionID, sdp string) (Signal, error) {
 	if len(data) > MaxSignalBytes {
 		return Signal{}, fmt.Errorf("offer is %d bytes, over core's %d cap", len(data), MaxSignalBytes)
 	}
-	return Signal{SessionID: sessionID, Kind: KindOffer, Data: data}, nil
+	return Signal{SessionID: sessionID, Kind: KindOffer, Data: data, PeerID: peerID}, nil
 }
 
 // Status is play_session_status.

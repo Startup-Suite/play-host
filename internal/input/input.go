@@ -6,24 +6,29 @@
 // Browser -> host, on the two data channels:
 //
 //	input-events (reliable, ordered):
-//	  {"t":"key","code":"KeyW","down":true,"repeat":false,"slot":0}
+//	  {"t":"key","code":"KeyW","down":true,"repeat":false,"src":0}
 //	  {"t":"release_all"}
-//	  {"t":"probe","seq":N}
+//	  {"t":"probe","seq":N,"src":0}
 //	input-state (unordered, maxRetransmits 0; each message is a full,
 //	idempotent snapshot, so a lost one is corrected by the next):
-//	  {"t":"pad","slot":0,"seq":N,"connected":true,
+//	  {"t":"pad","src":0,"seq":N,"connected":true,
 //	   "buttons":[17 numbers 0..1],"axes":[4 numbers -1..1]}   (W3C standard mapping)
 //
 // Host -> addon, newline-delimited JSON on the 127.0.0.1 link:
 //
-//	{"t":"key","k":"W","loc":0,"p":true,"e":false}   k: Godot key name; loc 0 none, 1 left, 2 right
-//	{"t":"jb","d":0,"b":0,"p":true,"v":1}             InputEventJoypadButton
-//	{"t":"ja","d":0,"a":0,"v":-0.5}                  InputEventJoypadMotion
+//	{"t":"key","d":0,"k":"W","loc":0,"p":true,"e":false}   d: slot; k: Godot key name; loc 0 none, 1 left, 2 right
+//	{"t":"jb","d":0,"b":0,"p":true,"v":1}                 InputEventJoypadButton
+//	{"t":"ja","d":0,"a":0,"v":-0.5}                      InputEventJoypadMotion
+//	{"t":"release","d":0}   releases what device d holds (multi-peer)
 //	{"t":"release_all"}  {"t":"probe","seq":N}  {"t":"export","on":true}
 //
-// `slot` is the player slot and becomes the Godot device index. v1 plays
-// one slot (0); the multi-player follow-on (task 01a0dbd6) needs no new
-// message shape, only more than one slot allowed (MaxSlots).
+// SLOTS ARE HOST-HELD (task 01a0dbd6). `src` is the browser's local
+// controller ordinal (0 = keyboard and the first pad; absent means 0). The
+// player slot, which becomes the Godot device index `d`, comes ONLY from the
+// table core sends in play_slots for (peer_id, src): see Binding. A `slot`
+// key in a browser message is not even decoded, so a browser cannot name a
+// slot. A peer whose table holds no slot for the message's src has the
+// message dropped and counted (a spectator holds none at all).
 package input
 
 import (
@@ -31,9 +36,6 @@ import (
 	"fmt"
 	"math"
 )
-
-// MaxSlots is how many player slots the host accepts. v1 is single-player.
-var MaxSlots = 1
 
 // Out is one line for the addon.
 type Out map[string]any
@@ -44,7 +46,7 @@ type Browser struct {
 	Code      string    `json:"code,omitempty"`
 	Down      bool      `json:"down,omitempty"`
 	Repeat    bool      `json:"repeat,omitempty"`
-	Slot      int       `json:"slot,omitempty"`
+	Src       int       `json:"src,omitempty"`
 	Seq       int64     `json:"seq,omitempty"`
 	Connected *bool     `json:"connected,omitempty"`
 	Buttons   []float64 `json:"buttons,omitempty"`
@@ -158,58 +160,59 @@ func NewTranslator() *Translator {
 type Result struct {
 	Lines []Out
 	// Activity is true when the message changed game input (key edge, pad
-	// change, release_all, probe). A pad snapshot that changes nothing is
-	// NOT activity, so a controller left plugged in cannot hold a session
-	// open past its idle timeout.
+	// change, release, probe). A pad snapshot that changes nothing is NOT
+	// activity, so a controller left plugged in cannot hold a session open
+	// past its idle timeout.
 	Activity bool
+	// Slot is the slot the message was bound to, or -1 (release_all, a
+	// dropped message).
+	Slot int
+	// Dropped names why the message was dropped ("" when it was not):
+	// DropNoSlot for a src with no slot in the table.
+	Dropped string
 }
 
-// Handle decodes and translates one data-channel message.
-func (t *Translator) Handle(label string, data []byte) (Result, error) {
+// Drop reasons.
+const (
+	DropNoSlot       = "no slot"
+	DropProbeNoSpace = "probe slot outside the 2-bit namespace"
+)
+
+// Decode parses one data-channel message.
+func Decode(label string, data []byte) (Browser, error) {
 	var m Browser
 	if err := json.Unmarshal(data, &m); err != nil {
-		return Result{}, fmt.Errorf("%s: %w", label, err)
+		return m, fmt.Errorf("%s: %w", label, err)
 	}
-	if m.Slot < 0 || m.Slot >= MaxSlots {
-		return Result{}, fmt.Errorf("slot %d out of range (max %d)", m.Slot, MaxSlots)
+	if m.Src < 0 {
+		m.Src = 0
 	}
-	switch m.T {
-	case "key":
-		return t.key(m), nil
-	case "pad":
-		return t.pad(m), nil
-	case "release_all":
-		return Result{Lines: t.ReleaseAll(), Activity: true}, nil
-	case "probe":
-		return Result{Lines: []Out{{"t": "probe", "seq": m.Seq}}, Activity: true}, nil
-	default:
-		// Unknown types are ignored (forward compatibility).
-		return Result{}, nil
-	}
+	return m, nil
 }
 
-func (t *Translator) key(m Browser) Result {
+// Key translates a key edge for slot.
+func (t *Translator) Key(m Browser, slot int) Result {
 	k, ok := keyMap[m.Code]
 	if !ok {
-		return Result{}
+		return Result{Slot: slot}
 	}
-	held := t.keys[m.Slot]
+	held := t.keys[slot]
 	if held == nil {
 		held = map[string]bool{}
-		t.keys[m.Slot] = held
+		t.keys[slot] = held
 	}
 	if m.Down {
 		if held[m.Code] && !m.Repeat {
-			return Result{} // duplicate down, not an edge
+			return Result{Slot: slot} // duplicate down, not an edge
 		}
 		held[m.Code] = true
 	} else {
 		if !held[m.Code] {
-			return Result{} // up without down (focus came in mid-press)
+			return Result{Slot: slot} // up without down (focus came in mid-press)
 		}
 		delete(held, m.Code)
 	}
-	return Result{Lines: []Out{{"t": "key", "k": k.name, "loc": k.loc, "p": m.Down, "e": m.Down && m.Repeat}}, Activity: true}
+	return Result{Lines: []Out{{"t": "key", "d": slot, "k": k.name, "loc": k.loc, "p": m.Down, "e": m.Down && m.Repeat}}, Activity: true, Slot: slot}
 }
 
 func clamp(v, lo, hi float64) float64 {
@@ -219,18 +222,19 @@ func clamp(v, lo, hi float64) float64 {
 	return math.Max(lo, math.Min(hi, v))
 }
 
-func (t *Translator) pad(m Browser) Result {
-	p := t.pads[m.Slot]
+// Pad diffs a pad snapshot for slot.
+func (t *Translator) Pad(m Browser, slot int) Result {
+	p := t.pads[slot]
 	if p == nil {
 		p = &pad{}
-		t.pads[m.Slot] = p
+		t.pads[slot] = p
 	}
 	if p.have && m.Seq <= p.seq {
-		return Result{} // stale or duplicate snapshot on the unordered channel
+		return Result{Slot: slot} // stale or duplicate snapshot on the unordered channel
 	}
 	p.have, p.seq = true, m.Seq
 	if m.Connected != nil && !*m.Connected {
-		return Result{Lines: t.releasePad(m.Slot), Activity: true}
+		return Result{Lines: t.releasePad(slot), Activity: true, Slot: slot}
 	}
 	var out []Out
 	for i := 0; i < stdButtons; i++ {
@@ -242,14 +246,14 @@ func (t *Translator) pad(m Browser) Result {
 			ti := a - axisTriggerLeft
 			if math.Abs(v-p.trig[ti]) >= axisEpsilon || (v == 0 && p.trig[ti] != 0) {
 				p.trig[ti] = v
-				out = append(out, Out{"t": "ja", "d": m.Slot, "a": a, "v": v})
+				out = append(out, Out{"t": "ja", "d": slot, "a": a, "v": v})
 			}
 			continue
 		}
 		pressed := v >= pressThreshold
 		if pressed != p.pressed[i] {
 			p.pressed[i] = pressed
-			out = append(out, Out{"t": "jb", "d": m.Slot, "b": buttonMap[i], "p": pressed, "v": v})
+			out = append(out, Out{"t": "jb", "d": slot, "b": buttonMap[i], "p": pressed, "v": v})
 		}
 	}
 	for i := 0; i < stdAxes; i++ {
@@ -259,10 +263,10 @@ func (t *Translator) pad(m Browser) Result {
 		}
 		if math.Abs(v-p.axes[i]) >= axisEpsilon || (v == 0 && p.axes[i] != 0) {
 			p.axes[i] = v
-			out = append(out, Out{"t": "ja", "d": m.Slot, "a": axisMap[i], "v": v})
+			out = append(out, Out{"t": "ja", "d": slot, "a": axisMap[i], "v": v})
 		}
 	}
-	return Result{Lines: out, Activity: len(out) > 0}
+	return Result{Lines: out, Activity: len(out) > 0, Slot: slot}
 }
 
 func (t *Translator) releasePad(slot int) []Out {
@@ -292,20 +296,38 @@ func (t *Translator) releasePad(slot int) []Out {
 	return out
 }
 
+func (t *Translator) releaseKeys(slot int) []Out {
+	var out []Out
+	for code := range t.keys[slot] {
+		k := keyMap[code]
+		out = append(out, Out{"t": "key", "d": slot, "k": k.name, "loc": k.loc, "p": false, "e": false})
+	}
+	delete(t.keys, slot)
+	return out
+}
+
 // ReleaseAll releases every held key and pad input on every slot, then asks
 // the addon to release whatever it believes is held (belt and braces: the
-// addon also tracks what it pressed).
+// addon also tracks what it pressed). This is the v1 (single-peer) release:
+// the addon's release_all drops EVERY device, so a multi-peer session uses
+// ReleaseSlot per slot instead.
 func (t *Translator) ReleaseAll() []Out {
 	var out []Out
-	for slot, held := range t.keys {
-		for code := range held {
-			k := keyMap[code]
-			out = append(out, Out{"t": "key", "k": k.name, "loc": k.loc, "p": false, "e": false})
-		}
-		delete(t.keys, slot)
+	for slot := range t.keys {
+		out = append(out, t.releaseKeys(slot)...)
 	}
 	for slot := range t.pads {
 		out = append(out, t.releasePad(slot)...)
 	}
 	return append(out, Out{"t": "release_all"})
+}
+
+// ReleaseSlot releases what this translator holds on one slot, then asks the
+// addon to release whatever it believes device `slot` holds. The pad's diff
+// state is forgotten, so the next snapshot for the slot starts clean.
+func (t *Translator) ReleaseSlot(slot int) []Out {
+	out := t.releaseKeys(slot)
+	out = append(out, t.releasePad(slot)...)
+	delete(t.pads, slot)
+	return append(out, Out{"t": "release", "d": slot})
 }

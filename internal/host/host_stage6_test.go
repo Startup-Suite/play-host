@@ -16,10 +16,12 @@ import (
 // Stage 6 (task 01a0db5f): the review's findings B and C, and the checkout
 // clause of case 5.
 
-// B: repeated takeovers inside the 10-port range. Each takeover closes the
-// old peer BEFORE the new one gathers, so ports are released; with the old
-// asynchronous close a leaked peer would exhaust 40360-40369 within a few
-// switches and the re-offer's gathering would fail.
+// B: repeated takeovers. Each takeover closes the old peer BEFORE the new
+// one gathers. Written against the 10-port range, where a leaked peer would
+// exhaust it within a few switches; since task 01a0dbd6 every peer shares
+// one muxed port, so this now asserts that twelve replace cycles leave the
+// session live and re-offering (a leak would show as a mux ufrag collision
+// or a stalled re-offer instead).
 func TestRepeatedTakeoversStayInsideThePortRange(t *testing.T) {
 	rtc.DisconnectGrace = 200 * time.Millisecond
 	st := &fakeStages{t: t, port: 40340, prepared: make(chan struct{})}

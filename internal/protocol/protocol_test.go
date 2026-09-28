@@ -62,7 +62,7 @@ func TestDecodeSessionStartDefaultsAndRejects(t *testing.T) {
 }
 
 func TestSignalData(t *testing.T) {
-	off, err := NewOfferSignal("s", "v=0\r\n")
+	off, err := NewOfferSignal("s", "", "v=0\r\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestSignalData(t *testing.T) {
 			t.Errorf("end-of-candidates %q read as ok=%v err=%v", end, ok, err)
 		}
 	}
-	if _, err := NewOfferSignal("s", strings.Repeat("a", MaxSignalBytes)); err == nil {
+	if _, err := NewOfferSignal("s", "", strings.Repeat("a", MaxSignalBytes)); err == nil {
 		t.Fatal("oversized offer accepted")
 	}
 }
@@ -114,5 +114,51 @@ func TestStatus(t *testing.T) {
 		if Terminal(st) != want {
 			t.Errorf("Terminal(%s)", st)
 		}
+	}
+}
+
+// Task 01a0dbd6: the widened frames, in the shapes core's
+// Protocol.peer_open_payload/2, slots_payload/3 and parse_slot_activity/1
+// produce and accept (core protocol.ex, "Widening").
+func TestMultiPeerFrames(t *testing.T) {
+	off, err := NewOfferSignal("s", "01a0e9b0-0000-7000-8000-00000000000a", "v=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(off)
+	if got := string(b); got != `{"session_id":"s","kind":"offer","data":{"type":"offer","sdp":"v=0"},"peer_id":"01a0e9b0-0000-7000-8000-00000000000a"}` {
+		t.Fatalf("peer-tagged offer wire %s", got)
+	}
+
+	var ans Signal
+	if err := json.Unmarshal([]byte(`{"session_id":"s","kind":"answer","data":"v=0","peer_id":"p1"}`), &ans); err != nil || ans.PeerID != "p1" {
+		t.Fatalf("peer-tagged answer %+v %v", ans, err)
+	}
+	var v1 Signal
+	if err := json.Unmarshal([]byte(`{"session_id":"s","kind":"answer","data":"v=0","peer_id":null}`), &v1); err != nil || v1.PeerID != "" {
+		t.Fatalf("null peer_id must read as the v1 peer: %+v %v", v1, err)
+	}
+
+	var open PeerRef
+	if err := json.Unmarshal([]byte(`{"session_id":"s","peer_id":"p1"}`), &open); err != nil || open.PeerID != "p1" || open.SessionID != "s" {
+		t.Fatalf("peer_open %+v %v", open, err)
+	}
+
+	var sl Slots
+	raw := `{"session_id":"s","max_players":4,"peers":{"p1":{"0":0,"1":2},"spec":{},"bad":{"x":1,"-1":1,"3":-1}},"unknown":true}`
+	if err := json.Unmarshal([]byte(raw), &sl); err != nil {
+		t.Fatal(err)
+	}
+	tab := sl.Table()
+	if sl.MaxPlayers != 4 || len(tab) != 3 || tab["p1"][0] != 0 || tab["p1"][1] != 2 || len(tab["p1"]) != 2 {
+		t.Fatalf("table %v", tab)
+	}
+	if len(tab["spec"]) != 0 || len(tab["bad"]) != 0 {
+		t.Fatalf("a spectator or a malformed entry bound a slot: %v", tab)
+	}
+
+	b, _ = json.Marshal(SlotActivity{SessionID: "s", Slots: []int{0, 2}})
+	if string(b) != `{"session_id":"s","slots":[0,2]}` {
+		t.Fatalf("slot activity wire %s", b)
 	}
 }

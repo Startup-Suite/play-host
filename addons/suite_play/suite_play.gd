@@ -5,10 +5,13 @@ extends Node
 ## Listens on 127.0.0.1:<--suite-play-port> for exactly one connection from
 ## the play host, which carries:
 ##   host -> game: newline-delimited JSON (see internal/input in play-host):
-##     {"t":"key","k":"W","loc":0,"p":true,"e":false}  k = Godot key name
-##     {"t":"jb","d":0,"b":0,"p":true,"v":1}          joypad button, device d
-##     {"t":"ja","d":0,"a":0,"v":-0.5}               joypad axis, device d
+##     {"t":"key","d":0,"k":"W","loc":0,"p":true,"e":false}  k = Godot key name, device d
+##     {"t":"jb","d":0,"b":0,"p":true,"v":1}                joypad button, device d
+##     {"t":"ja","d":0,"a":0,"v":-0.5}                     joypad axis, device d
+##     {"t":"release","d":0}  releases what device d holds
 ##     {"t":"release_all"}  {"t":"probe","seq":N}  {"t":"export","on":true}
+## d is the player SLOT the host bound the input to (P1 = 0), never a value
+## the browser chose. A key line without d is device 0 (a v1 host).
 ##   game -> host: frames while export is on (frame path C, stage 1).
 ## Frame record (little-endian): "SPF1", u32 width, u32 height, u32 kind
 ## (1 = Image.FORMAT_RGBA8 from get_image, 2 = RD texture bytes), u32 length, bytes.
@@ -20,6 +23,15 @@ extends Node
 ## Probe marker: a 4x4 grid of 16x16 px cells in the top-left corner, row-major,
 ## MSB first, value = seq << 4 | check(seq), check = (s ^ s>>4 ^ s>>8 ^ 0xA) & 0xF.
 ## Drawn for 2 frames per probe, black otherwise. Pinned by internal/probe in Go.
+## A multi-player host forwards seq = slot << 10 | (seq & 0x3FF), so the top 2
+## bits name the slot; this file draws whatever seq it is given.
+##
+## For games (task 01a0dbd6, recorded for Voltron): every event this addon
+## parses carries event.device = the slot. KEY POLLING has no device:
+## Input.is_physical_key_pressed / is_key_pressed / is_action_pressed are
+## global, so two keyboard players are distinct ONLY in _input /
+## _unhandled_input via event.device. Pads are distinct by polling too,
+## through Input.get_joy_axis(d, ...) and is_joy_button_pressed(d, ...).
 
 const CELLS := 4
 const CELL_PX := 16
@@ -45,7 +57,7 @@ var _async_inflight := 0
 var frames_sent := 0
 var probes_seen := 0
 var _keycodes := {}  # name -> Key
-var _held_keys := {}  # "keycode:loc" -> [keycode, loc]
+var _held_keys := {}  # "d:keycode:loc" -> [keycode, loc, d]
 var _held_buttons := {}  # "d:b" -> [d, b]
 var _held_axes := {}  # "d:a" -> [d, a]
 var _checked_key := false
@@ -147,11 +159,13 @@ func handle_line(line: String) -> void:
 		"probe":
 			show_probe(int(msg.get("seq", 0)))
 		"key":
-			_key(str(msg.get("k", "")), int(msg.get("loc", 0)), bool(msg.get("p", false)), bool(msg.get("e", false)))
+			_key(str(msg.get("k", "")), int(msg.get("loc", 0)), bool(msg.get("p", false)), bool(msg.get("e", false)), int(msg.get("d", 0)))
 		"jb":
 			_joy_button(int(msg.get("d", 0)), int(msg.get("b", 0)), bool(msg.get("p", false)), float(msg.get("v", 0.0)))
 		"ja":
 			_joy_axis(int(msg.get("d", 0)), int(msg.get("a", 0)), float(msg.get("v", 0.0)))
+		"release":
+			release_device(int(msg.get("d", 0)))
 		"release_all":
 			release_all()
 		"export":
@@ -169,19 +183,20 @@ func keycode_for(name: String) -> int:
 	return int(_keycodes[name])
 
 
-func _key(name: String, loc: int, pressed: bool, echo: bool) -> void:
+func _key(name: String, loc: int, pressed: bool, echo: bool, device: int = 0) -> void:
 	var code := keycode_for(name)
 	if code == KEY_NONE:
 		return
 	var ev := InputEventKey.new()
+	ev.device = device
 	ev.keycode = code
 	ev.physical_keycode = code
 	ev.location = loc
 	ev.pressed = pressed
 	ev.echo = echo
-	var id := "%d:%d" % [code, loc]
+	var id := "%d:%d:%d" % [device, code, loc]
 	if pressed:
-		_held_keys[id] = [code, loc]
+		_held_keys[id] = [code, loc, device]
 	else:
 		_held_keys.erase(id)
 	Input.parse_input_event(ev)
@@ -222,30 +237,51 @@ func _joy_axis(device: int, axis: int, value: float) -> void:
 		print("suite_play: first axis d%d a%d v=%.3f -> Input.get_joy_axis=%.3f" % [device, axis, value, Input.get_joy_axis(device, axis)])
 
 
-## Releases every key, button and axis this addon pressed.
+## Releases every key, button and axis this addon pressed, on every device.
 func release_all() -> void:
-	for k in _held_keys.values():
+	_release(-1)
+
+
+## Releases what device d holds, and nothing another device holds (one
+## player leaving, or being taken over, must not lift another's keys).
+func release_device(d: int) -> void:
+	_release(d)
+
+
+## device -1 = all.
+func _release(device: int) -> void:
+	for id in _held_keys.keys():
+		var k: Array = _held_keys[id]
+		if device >= 0 and k[2] != device:
+			continue
 		var ev := InputEventKey.new()
+		ev.device = k[2]
 		ev.keycode = k[0]
 		ev.physical_keycode = k[0]
 		ev.location = k[1]
 		ev.pressed = false
 		Input.parse_input_event(ev)
-	_held_keys.clear()
-	for b in _held_buttons.values():
+		_held_keys.erase(id)
+	for id in _held_buttons.keys():
+		var b: Array = _held_buttons[id]
+		if device >= 0 and b[0] != device:
+			continue
 		var ev := InputEventJoypadButton.new()
 		ev.device = b[0]
 		ev.button_index = b[1]
 		ev.pressed = false
 		Input.parse_input_event(ev)
-	_held_buttons.clear()
-	for a in _held_axes.values():
+		_held_buttons.erase(id)
+	for id in _held_axes.keys():
+		var a: Array = _held_axes[id]
+		if device >= 0 and a[0] != device:
+			continue
 		var ev := InputEventJoypadMotion.new()
 		ev.device = a[0]
 		ev.axis = a[1]
 		ev.axis_value = 0.0
 		Input.parse_input_event(ev)
-	_held_axes.clear()
+		_held_axes.erase(id)
 
 
 func _on_frame_post_draw() -> void:

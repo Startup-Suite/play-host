@@ -171,7 +171,10 @@ func TestJoinDeclaresFeatureAndRoutesBroadcasts(t *testing.T) {
 	ci := fc.joins[0]["client_info"].(map[string]any)
 	fc.mu.Unlock()
 	feats := ci["features"].([]any)
-	if len(feats) != 1 || feats[0] != "game_stream_host" || ci["product"] != "play-host" {
+	// game_stream_multi is what makes core send play_peer_open (task
+	// 01a0dbd6): without it core keeps v1 wiring and never asks for a fresh
+	// offer on a same-page re-attach.
+	if len(feats) != 2 || feats[0] != "game_stream_host" || feats[1] != "game_stream_multi" || ci["product"] != "play-host" {
 		t.Fatalf("client_info %v", ci)
 	}
 

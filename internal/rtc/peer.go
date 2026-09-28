@@ -110,12 +110,84 @@ type Peer struct {
 	dcTimer   *time.Timer
 }
 
-// NewAPI builds a pion API from cfg.
+// NewAPI builds a pion API from cfg. Every peer binds its own socket in the
+// PortMin-PortMax range (the spike harness uses this).
 func NewAPI(cfg Config) (*webrtc.API, error) {
+	se, err := settingEngine(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newAPI(se)
+}
+
+// NewMuxAPI builds a pion API whose peers ALL share one UDP port, PortMin,
+// through a single-port ICE mux (task 01a0dbd6): pion demultiplexes by ICE
+// ufrag, so N viewers hold one socket per allowed interface address instead
+// of one socket each. Without it every peer bound its own port in the
+// 10-port range and 4 players + 4 spectators would exhaust it. The range
+// stays set for any non-mux socket pion opens. (Relay candidates are
+// allocated from an ephemeral local socket to the TURN server either way.)
+//
+// The returned closer releases the port; close it after every peer.
+func NewMuxAPI(cfg Config) (*webrtc.API, io.Closer, error) {
+	if cfg.PortMin == 0 {
+		return nil, nil, errors.New("udp mux needs a port (udp_min)")
+	}
+	se, err := settingEngine(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts := []ice.UDPMuxFromPortOption{ice.UDPMuxFromPortWithNetworks(ice.NetworkTypeUDP4)}
+	if f := ipFilter(cfg); f != nil {
+		opts = append(opts, ice.UDPMuxFromPortWithIPFilter(f))
+	}
+	if cfg.IncludeLoopback {
+		opts = append(opts, ice.UDPMuxFromPortWithLoopback())
+	}
+	if se.LoggerFactory != nil {
+		opts = append(opts, ice.UDPMuxFromPortWithLogger(se.LoggerFactory.NewLogger("udpmux")))
+	}
+	mux, err := ice.NewMultiUDPMuxFromPort(int(cfg.PortMin), opts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("udp mux on %d: %w", cfg.PortMin, err)
+	}
+	se.SetICEUDPMux(mux)
+	api, err := newAPI(se)
+	if err != nil {
+		mux.Close()
+		return nil, nil, err
+	}
+	return api, mux, nil
+}
+
+// MuxAddrs lists the addresses a NewMuxAPI closer is listening on.
+func MuxAddrs(c io.Closer) []net.Addr {
+	if m, ok := c.(*ice.MultiUDPMuxDefault); ok {
+		return m.GetListenAddresses()
+	}
+	return nil
+}
+
+func ipFilter(cfg Config) func(net.IP) bool {
+	if len(cfg.AllowIPs) == 0 {
+		return nil
+	}
+	allow := append([]net.IP(nil), cfg.AllowIPs...)
+	return func(ip net.IP) bool {
+		for _, a := range allow {
+			if a.Equal(ip) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func settingEngine(cfg Config) (webrtc.SettingEngine, error) {
 	se := webrtc.SettingEngine{}
 	if cfg.PortMin != 0 {
 		if err := se.SetEphemeralUDPPortRange(cfg.PortMin, cfg.PortMax); err != nil {
-			return nil, fmt.Errorf("udp port range: %w", err)
+			return se, fmt.Errorf("udp port range: %w", err)
 		}
 	}
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
@@ -128,17 +200,13 @@ func NewAPI(cfg Config) (*webrtc.API, error) {
 			ScopeLevels:     map[string]logging.LogLevel{"ice": logging.LogLevelWarn},
 		}
 	}
-	if len(cfg.AllowIPs) > 0 {
-		allow := append([]net.IP(nil), cfg.AllowIPs...)
-		se.SetIPFilter(func(ip net.IP) bool {
-			for _, a := range allow {
-				if a.Equal(ip) {
-					return true
-				}
-			}
-			return false
-		})
+	if f := ipFilter(cfg); f != nil {
+		se.SetIPFilter(f)
 	}
+	return se, nil
+}
+
+func newAPI(se webrtc.SettingEngine) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, err
@@ -328,9 +396,9 @@ func (p *Peer) SelectedPair() string {
 // State is the peer connection state.
 func (p *Peer) State() string { return p.pc.ConnectionState().String() }
 
-// Close ends the connection and waits for pion to release its sockets, so
-// the next peer can bind in the same 10-port range. Safe on a nil Peer and
-// safe to call twice.
+// Close ends the connection and waits for pion to release its sockets (and
+// its ufrag's slot in a shared mux). Safe on a nil Peer and safe to call
+// twice.
 func (p *Peer) Close() {
 	if p == nil {
 		return

@@ -7,6 +7,24 @@
 // One session at a time: a start while one is running answers `failed` with
 // detail "host busy" for the NEW session id and leaves the running one alone.
 // A session with no input for idle_timeout_s ends with reason "idle".
+//
+// N peers, one encode (task 01a0dbd6). A session holds `peers`, one per
+// WebRTC connection, keyed by the core-minted peer_id (internal/protocol,
+// "Widening"). ffmpeg/NVENC encodes ONCE into one TrackLocalStaticRTP, and
+// every peer binds that same track, so VRAM is flat and only upstream grows
+// with viewers. The encoder and the addon's export run while at least one
+// peer is connected and stop at zero, so a joiner or a leaver never restarts
+// the stream for the others. All peers share one UDP port (rtc.NewMuxAPI).
+// Each peer's input is bound to the slots core's play_slots names for it
+// (input.Binding); a peer with none (a spectator) has every message dropped
+// and counted, because input never passes through core and this is the only
+// place it can be stopped.
+//
+// An old core sends no play_peer_open and no play_slots. Then the host keeps
+// v1 exactly: one implicit peer (peer_id ""), src 0 is slot 0, and a peer
+// that ends is re-offered with a fresh `connecting` status. The first
+// play_peer_open or play_slots switches the session to multi-peer for good
+// (and closes the implicit peer if it was already offered).
 package host
 
 import (
@@ -18,6 +36,7 @@ import (
 	"net"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -183,6 +202,26 @@ func (h *Host) OnEvent(event string, payload json.RawMessage) {
 		if s := h.Current(); s != nil && s.ID() == sig.SessionID {
 			s.signal(sig)
 		}
+	case protocol.EventPeerOpen, protocol.EventPeerClose:
+		var r protocol.PeerRef
+		if json.Unmarshal(payload, &r) != nil || r.PeerID == "" {
+			return
+		}
+		if s := h.Current(); s != nil && s.ID() == r.SessionID {
+			if event == protocol.EventPeerOpen {
+				s.peerOpen(r.PeerID)
+			} else {
+				s.peerClose(r.PeerID)
+			}
+		}
+	case protocol.EventSlots:
+		var sl protocol.Slots
+		if json.Unmarshal(payload, &sl) != nil {
+			return
+		}
+		if s := h.Current(); s != nil && s.ID() == sl.SessionID {
+			s.setSlots(sl)
+		}
 	default:
 		// capabilities, spaces manifest, etc.: not for the play host.
 	}
@@ -276,20 +315,64 @@ type Session struct {
 	godot     launch.Proc
 	link      *link.Link
 	api       *webrtc.API
+	mux       io.Closer // the one shared UDP port
 	rtcCfg    rtc.Config
 	track     *webrtc.TrackLocalStaticRTP
 	enc       *media.Pipeline
-	peer      *rtc.Peer
-	trMu      sync.Mutex
-	tr        *input.Translator
 	events    chan func()
 	liveSent  atomic.Bool
 	exporting atomic.Bool
+
+	// peers is touched ONLY on the session loop.
+	peers map[string]*peerState
+
+	// pmu guards what core tells the host about peers. It is written from
+	// the socket's goroutine (OnEvent) at any time, including while the
+	// session is still building, and read by the loop in reconcile.
+	pmu        sync.Mutex
+	multi      bool                   // core has sent a multi-peer frame
+	mediaReady bool                   // setupMedia done; reconcile may create peers
+	openSeq    int                    // play_peer_open counter
+	want       map[string]int         // peer_id -> the play_peer_open seq it must answer
+	table      map[string]map[int]int // play_slots: peer_id -> src -> slot
+	maxPlayers int
+
+	actMu    sync.Mutex
+	activity map[int]bool // slots with input since the last play_slot_activity
 }
+
+// peerState is one WebRTC connection and its input binding.
+type peerState struct {
+	id        string // "" is the v1 implicit peer
+	seq       int    // the play_peer_open this connection answers
+	peer      *rtc.Peer
+	in        *input.Binding
+	connected bool // loop only
+	closed    atomic.Bool
+
+	drops      atomic.Int64 // since the last drop log line
+	dropsTotal atomic.Int64
+	lastDrop   atomic.Int64 // unix nanos of the last drop log line
+	dropWhy    atomic.Value // string
+}
+
+func (p *peerState) name() string {
+	if p.id == "" {
+		return "v1"
+	}
+	return p.id
+}
+
+// DropLogEvery bounds the per-peer "dropped input" log line.
+var DropLogEvery = 10 * time.Second
+
+// ActivityEvery is the play_slot_activity throttle (at most 4 per second).
+var ActivityEvery = 250 * time.Millisecond
 
 func newSession(h *Host, st protocol.SessionStart) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Session{h: h, start: st, t0: time.Now(), ctx: ctx, stopF: cancel, report: true, events: make(chan func(), 64), tr: input.NewTranslator()}
+	s := &Session{h: h, start: st, t0: time.Now(), ctx: ctx, stopF: cancel, report: true, events: make(chan func(), 64),
+		peers: map[string]*peerState{}, want: map[string]int{}, table: map[string]map[int]int{}, activity: map[int]bool{}}
 	s.lastInput.Store(time.Now().UnixNano())
 	return s
 }
@@ -353,8 +436,9 @@ func (s *Session) signal(sig protocol.Signal) {
 }
 
 func (s *Session) applySignal(sig protocol.Signal) {
-	if s.peer == nil {
-		s.logf("signal %s before the peer exists; dropped", sig.Kind)
+	ps := s.peers[sig.PeerID]
+	if ps == nil || ps.peer == nil {
+		s.logf("signal %s for peer %q before the peer exists; dropped", sig.Kind, sig.PeerID)
 		return
 	}
 	switch sig.Kind {
@@ -364,8 +448,8 @@ func (s *Session) applySignal(sig protocol.Signal) {
 			s.logf("answer: %v", err)
 			return
 		}
-		if err := s.peer.SetAnswer(d.SDP); err != nil {
-			s.logf("answer: %v", err)
+		if err := ps.peer.SetAnswer(d.SDP); err != nil {
+			s.logf("answer (peer %s): %v", ps.name(), err)
 		}
 	case protocol.KindICE:
 		c, ok, err := sig.Candidate()
@@ -373,9 +457,88 @@ func (s *Session) applySignal(sig protocol.Signal) {
 			return
 		}
 		init := webrtc.ICECandidateInit{Candidate: c.Candidate, SDPMid: c.SDPMid, SDPMLineIndex: c.SDPMLineIndex, UsernameFragment: c.UsernameFragment}
-		if err := s.peer.AddICECandidate(init); err != nil {
-			s.logf("ice: %v", err)
+		if err := ps.peer.AddICECandidate(init); err != nil {
+			s.logf("ice (peer %s): %v", ps.name(), err)
 		}
+	}
+}
+
+// peerOpen records core's play_peer_open: create, or REPLACE, that peer.
+// Recorded at once (the session may still be building); the loop acts on it.
+func (s *Session) peerOpen(id string) {
+	s.pmu.Lock()
+	s.multi = true
+	s.openSeq++
+	s.want[id] = s.openSeq
+	ready := s.mediaReady
+	s.pmu.Unlock()
+	s.logf("play_peer_open %s", id)
+	if ready {
+		s.post(s.reconcile)
+	}
+}
+
+// peerClose records core's play_peer_close.
+func (s *Session) peerClose(id string) {
+	s.pmu.Lock()
+	s.multi = true
+	delete(s.want, id)
+	ready := s.mediaReady
+	s.pmu.Unlock()
+	s.logf("play_peer_close %s", id)
+	if ready {
+		s.post(s.reconcile)
+	}
+}
+
+// setSlots records core's play_slots snapshot.
+func (s *Session) setSlots(sl protocol.Slots) {
+	s.pmu.Lock()
+	s.multi = true
+	s.table = sl.Table()
+	s.maxPlayers = sl.MaxPlayers
+	ready := s.mediaReady
+	s.pmu.Unlock()
+	if ready {
+		s.post(s.reconcile)
+	}
+}
+
+// reconcile makes the live peers match what core asked for. Loop only.
+func (s *Session) reconcile() {
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.pmu.Lock()
+	multi := s.multi
+	want := make(map[string]int, len(s.want))
+	for id, seq := range s.want {
+		want[id] = seq
+	}
+	table := s.table
+	s.pmu.Unlock()
+	if !multi {
+		if s.peers[""] == nil {
+			s.openPeer("", 0)
+		}
+		return
+	}
+	if ps := s.peers[""]; ps != nil {
+		s.logf("core sent multi-peer frames: closing the v1 peer")
+		s.closePeer(ps)
+	}
+	for id, ps := range s.peers {
+		if _, ok := want[id]; !ok {
+			s.closePeer(ps)
+		}
+	}
+	for id, seq := range want {
+		if ps := s.peers[id]; ps == nil || ps.seq < seq {
+			s.openPeer(id, seq)
+		}
+	}
+	for id, ps := range s.peers {
+		s.sendLines(ps.in.SetSlots(table[id]))
 	}
 }
 
@@ -452,20 +615,25 @@ func (s *Session) run() {
 	}
 	go s.guard("frames", s.readFrames)
 
-	if err := s.offer(); err != nil {
-		s.fail("webrtc: " + err.Error())
-		return
-	}
+	s.pmu.Lock()
+	s.mediaReady = true
+	s.pmu.Unlock()
+	s.reconcile()
 	idle := time.Duration(s.start.IdleTimeoutS) * time.Second
 	tick := time.NewTicker(s.h.cfg.IdleCheck)
 	defer tick.Stop()
+	act := time.NewTicker(ActivityEvery)
+	defer act.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case f := <-s.events:
 			f()
+		case <-act.C:
+			s.flushActivity()
 		case <-tick.C:
+			s.flushDrops(false)
 			if time.Since(time.Unix(0, s.lastInput.Load())) >= idle {
 				s.end("idle")
 				return
@@ -474,17 +642,19 @@ func (s *Session) run() {
 	}
 }
 
-// setupMedia builds the pion API, the one video track and the encoder
-// pipeline; they outlive viewer reconnects.
+// setupMedia builds the pion API (one shared UDP port), the ONE video track
+// every peer binds, and the encoder pipeline; they outlive peers.
 func (s *Session) setupMedia() error {
 	cfg := rtc.Config{PortMin: s.h.cfg.UDPMin, PortMax: s.h.cfg.UDPMax, ICEServers: ICEServers(s.start.ICEServers), IncludeLoopback: s.h.cfg.Loopback, LogWriter: s.h.cfg.PionLog}
 	if s.h.cfg.HostIP != "" {
 		cfg.AllowIPs = []net.IP{net.ParseIP(s.h.cfg.HostIP)}
 	}
-	api, err := rtc.NewAPI(cfg)
+	api, mux, err := rtc.NewMuxAPI(cfg)
 	if err != nil {
 		return err
 	}
+	s.mux = mux
+	s.logf("ice udp mux listening on %v", rtc.MuxAddrs(mux))
 	track, err := rtc.NewVideoTrackRTP()
 	if err != nil {
 		return err
@@ -495,114 +665,211 @@ func (s *Session) setupMedia() error {
 	return nil
 }
 
-// post runs f on the session loop, unless the session is over.
-func (s *Session) post(f func()) {
+// post runs f on the session loop, unless the session is over; it reports
+// whether f was queued.
+func (s *Session) post(f func()) bool {
+	if s.ctx.Err() != nil {
+		return false
+	}
 	select {
 	case s.events <- f:
+		return true
 	case <-s.ctx.Done():
+		return false
 	}
 }
 
-// offer publishes a fresh viewer offer, retrying a failed attempt (bounded,
-// with backoff) before giving up on the session. Stage 6: a re-offer after a
-// viewer change once timed out gathering and ended a live session; one
-// failed attempt is now a log line.
-func (s *Session) offer() error {
+// openPeer (re)creates peer id and gathers its offer off the loop. Loop only.
+func (s *Session) openPeer(id string, seq int) {
+	if old := s.peers[id]; old != nil {
+		s.closePeer(old)
+	}
+	ps := &peerState{id: id, seq: seq}
+	if id == "" {
+		ps.in = input.NewV1Binding()
+	} else {
+		ps.in = input.NewBinding()
+		s.pmu.Lock()
+		ps.in.SetSlots(s.table[id])
+		s.pmu.Unlock()
+	}
+	s.peers[id] = ps
+	go s.guard("offer", func() { s.gatherOffer(ps) })
+}
+
+// gatherOffer builds ps's connection, retrying a failed attempt (bounded,
+// with backoff). Stage 6 (01a0db5f): a re-offer after a viewer change once
+// timed out gathering and ended a live session; one failed attempt is now a
+// log line. It runs off the loop so one peer's gathering (up to
+// rtc.GatherTimeout over TURN) never stalls another peer's signals.
+func (s *Session) gatherOffer(ps *peerState) {
 	var err error
 	wait := s.h.cfg.OfferBackoff
 	for attempt := 1; attempt <= s.h.cfg.OfferAttempts; attempt++ {
-		if err = s.newPeer(); err == nil {
-			return nil
+		holder := new(*rtc.Peer)
+		var p *rtc.Peer
+		var offer string
+		var g rtc.Gather
+		p, offer, g, err = newPeerGather(s.api, s.rtcCfg, s.track, s.callbacks(ps, holder))
+		if err == nil {
+			if !s.post(func() { s.installPeer(ps, holder, p, offer, g) }) {
+				p.Close() // the session ended while it gathered
+			}
+			return
 		}
-		if s.ctx.Err() != nil {
-			return err
+		if s.ctx.Err() != nil || ps.closed.Load() {
+			return
 		}
-		s.logf("offer attempt %d/%d failed: %v", attempt, s.h.cfg.OfferAttempts, err)
+		s.logf("peer %s: offer attempt %d/%d failed: %v", ps.name(), attempt, s.h.cfg.OfferAttempts, err)
 		if attempt == s.h.cfg.OfferAttempts {
 			break
 		}
 		select {
 		case <-time.After(wait):
 		case <-s.ctx.Done():
-			return err
+			return
 		}
 		wait *= 2
 	}
-	return err
+	s.post(func() { s.offerFailed(ps, err) })
 }
 
-// newPeer creates a fresh viewer connection and publishes its offer.
-func (s *Session) newPeer() error {
-	s.trMu.Lock()
-	s.tr = input.NewTranslator()
-	s.trMu.Unlock()
-	var peer *rtc.Peer
-	// A callback from a peer that never became s.peer (its NewPeer failed and
-	// closed it) must do nothing: `peer` is still nil then, and so may
-	// s.peer be. Stage 6: that nil == nil case ran viewerGone on a nil peer
-	// and panicked the process.
-	mine := func() bool { return peer != nil && s.peer == peer }
-	p, offer, g, err := newPeerGather(s.api, s.rtcCfg, s.track, rtc.Callbacks{
+// callbacks are one connection attempt's pion callbacks. *holder is set on
+// the loop when the attempt becomes ps.peer; a callback from an attempt that
+// never did (its NewPeer failed and closed it), or from a connection since
+// replaced or closed, does nothing. Stage 6 (01a0db5f): the nil == nil case
+// of an older check ran viewerGone on a nil peer and panicked the process.
+// Callbacks post from their own goroutine: pion may run them inside Close,
+// which the loop itself calls.
+func (s *Session) callbacks(ps *peerState, holder **rtc.Peer) rtc.Callbacks {
+	mine := func() bool {
+		return *holder != nil && ps.peer == *holder && !ps.closed.Load() && s.peers[ps.id] == ps
+	}
+	return rtc.Callbacks{
 		OnPLI: func() {
-			s.logf("PLI/FIR from viewer: no forced IDR in the subprocess encoder; next IDR within GOP %d", s.start.Encoder.GOPFrames)
+			s.logf("PLI/FIR from peer %s: no forced IDR in the subprocess encoder; next IDR within GOP %d", ps.name(), s.start.Encoder.GOPFrames)
 		},
 		OnData: func(label string, data []byte) {
-			s.guard("input", func() { s.onInput(label, data) })
+			s.guard("input", func() { s.onInput(ps, label, data) })
 		},
 		OnConnected: func() {
-			s.post(func() {
+			go s.post(func() {
 				if !mine() {
 					return
 				}
-				s.logf("viewer connected: %s", peer.SelectedPair())
-				s.setExport(true)
+				s.logf("viewer connected (peer %s): %s", ps.name(), ps.peer.SelectedPair())
+				ps.connected = true
+				s.mediaCheck()
 			})
 		},
 		OnDone: func(reason string) {
-			s.post(func() {
+			go s.post(func() {
 				if !mine() {
 					return
 				}
-				s.logf("viewer gone: %s", reason)
-				s.viewerGone()
+				s.logf("viewer gone (peer %s): %s", ps.name(), reason)
+				s.peerEnded(ps)
 			})
 		},
-	})
-	if err != nil {
-		return err
 	}
-	s.logf("offer: %s", g)
-	peer = p
-	s.peer = p
-	sig, err := protocol.NewOfferSignal(s.ID(), offer)
-	if err != nil {
-		return err
-	}
-	s.h.push(protocol.EventSignal, sig)
-	s.liveSent.Store(false)
-	s.status(protocol.StateConnecting, "Waiting for the viewer")
-	return nil
 }
 
-// viewerGone runs on the session loop when the current peer ends. The old
-// peer is closed BEFORE the next one is created, so its UDP port in the
-// 10-port range and its TURN allocation are released first (it used to be
-// closed on a goroutine, racing the new peer's gathering).
-func (s *Session) viewerGone() {
-	old := s.peer
-	if old == nil {
+// installPeer publishes a gathered offer. Loop only.
+func (s *Session) installPeer(ps *peerState, holder **rtc.Peer, p *rtc.Peer, offer string, g rtc.Gather) {
+	if s.ctx.Err() != nil || ps.closed.Load() || s.peers[ps.id] != ps {
+		p.Close() // superseded while it gathered; its callbacks see a nil holder
 		return
 	}
-	s.peer = nil
-	s.setExport(false)
-	s.enc.Stop()
-	s.releaseAll()
-	old.Close()
+	*holder = p
+	ps.peer = p
+	s.logf("offer (peer %s): %s", ps.name(), g)
+	sig, err := protocol.NewOfferSignal(s.ID(), ps.id, offer)
+	if err != nil {
+		s.offerFailed(ps, err)
+		return
+	}
+	// connecting goes out BEFORE the offer, so whoever reads the offer can
+	// rely on the state (the stage-6 retry test read the state straight after
+	// the offer and raced the old push-then-status order).
+	if ps.id == "" {
+		// v1: every re-offer reports connecting and a fresh live.
+		s.liveSent.Store(false)
+		s.status(protocol.StateConnecting, "Waiting for the viewer")
+	} else if !s.liveSent.Load() {
+		// Multi-peer: live is sent once per session, and a later joiner's
+		// offer does not send the others' canvases back to connecting.
+		s.status(protocol.StateConnecting, "Waiting for the viewer")
+	}
+	s.h.push(protocol.EventSignal, sig)
+}
+
+// offerFailed: every attempt failed. The v1 peer is the only viewer, so the
+// session fails (as before). A multi-peer session keeps streaming to the
+// others; that peer stays down until core opens it again.
+func (s *Session) offerFailed(ps *peerState, err error) {
+	if ps.closed.Load() || s.peers[ps.id] != ps {
+		return
+	}
+	if ps.id == "" {
+		s.fail("webrtc: " + err.Error())
+		return
+	}
+	s.logf("peer %s: no offer after %d attempts (%v); dropped until core opens it again", ps.id, s.h.cfg.OfferAttempts, err)
+	s.closePeer(ps)
+}
+
+// peerEnded runs on the loop when a connection ends on its own (failed,
+// closed by the browser, disconnected past rtc.DisconnectGrace). It is
+// closed, its slots' input released, and it is re-offered under the same
+// peer_id while core still wants it (v1: always).
+func (s *Session) peerEnded(ps *peerState) {
+	s.closePeer(ps)
 	if s.ctx.Err() != nil {
 		return
 	}
-	if err := s.offer(); err != nil {
-		s.fail("webrtc: " + err.Error())
+	s.pmu.Lock()
+	multi := s.multi
+	seq, wanted := s.want[ps.id]
+	s.pmu.Unlock()
+	switch {
+	case ps.id == "" && !multi:
+		s.openPeer("", 0)
+	case ps.id != "" && wanted:
+		s.openPeer(ps.id, seq)
+	}
+}
+
+// closePeer closes one connection and releases ONLY its slots. The old
+// connection is closed before the next one is created, so its TURN
+// allocation is released first. Loop only.
+func (s *Session) closePeer(ps *peerState) {
+	ps.closed.Store(true) // before Close: no input from it after this
+	if s.peers[ps.id] == ps {
+		delete(s.peers, ps.id)
+	}
+	ps.connected = false
+	ps.peer.Close() // nil-safe
+	s.sendLines(ps.in.Release())
+	s.flushDropsFor(ps, true)
+	s.mediaCheck()
+}
+
+// mediaCheck runs the encoder and the addon's export while at least one
+// peer is connected, and stops them at zero. Loop only.
+func (s *Session) mediaCheck() {
+	n := 0
+	for _, ps := range s.peers {
+		if ps.connected {
+			n++
+		}
+	}
+	switch {
+	case n > 0 && !s.exporting.Load():
+		s.setExport(true)
+	case n == 0 && s.exporting.Load():
+		s.setExport(false)
+		s.enc.Stop()
+		s.logf("no connected peer: encoder and export stopped")
 	}
 }
 
@@ -627,24 +894,87 @@ func (s *Session) sendLines(lines []input.Out) {
 	}
 }
 
-func (s *Session) releaseAll() {
-	s.trMu.Lock()
-	lines := s.tr.ReleaseAll()
-	s.trMu.Unlock()
-	s.sendLines(lines)
-}
-
-func (s *Session) onInput(label string, data []byte) {
-	s.trMu.Lock()
-	r, err := s.tr.Handle(label, data)
-	s.trMu.Unlock()
+// onInput runs on pion's goroutines. The slot comes from ps's binding.
+func (s *Session) onInput(ps *peerState, label string, data []byte) {
+	if ps.closed.Load() {
+		return
+	}
+	r, err := ps.in.Handle(label, data)
 	if err != nil {
+		return
+	}
+	if r.Dropped != "" {
+		s.noteDrop(ps, r.Dropped, label)
 		return
 	}
 	if r.Activity {
 		s.lastInput.Store(time.Now().UnixNano())
+		if r.Slot >= 0 {
+			s.actMu.Lock()
+			s.activity[r.Slot] = true
+			s.actMu.Unlock()
+		}
 	}
 	s.sendLines(r.Lines)
+}
+
+// noteDrop counts a dropped message; the first one, and then at most one
+// line per DropLogEvery, is logged against the peer.
+func (s *Session) noteDrop(ps *peerState, why, label string) {
+	ps.dropsTotal.Add(1)
+	ps.drops.Add(1)
+	ps.dropWhy.Store(why + " (" + label + ")")
+	s.flushDropsFor(ps, false)
+}
+
+func (s *Session) flushDrops(force bool) {
+	for _, ps := range s.peers {
+		s.flushDropsFor(ps, force)
+	}
+}
+
+func (s *Session) flushDropsFor(ps *peerState, force bool) {
+	if ps.drops.Load() == 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := ps.lastDrop.Load()
+	if !force && now-last < int64(DropLogEvery) {
+		return
+	}
+	if !ps.lastDrop.CompareAndSwap(last, now) {
+		return
+	}
+	n := ps.drops.Swap(0)
+	if n == 0 {
+		return
+	}
+	why, _ := ps.dropWhy.Load().(string)
+	s.logf("peer %s: dropped %d input message(s), %d in total: %s", ps.name(), n, ps.dropsTotal.Load(), why)
+}
+
+// flushActivity sends play_slot_activity for the slots that saw input since
+// the last one (multi-peer only: an old core has no handler for it).
+func (s *Session) flushActivity() {
+	s.actMu.Lock()
+	if len(s.activity) == 0 {
+		s.actMu.Unlock()
+		return
+	}
+	slots := make([]int, 0, len(s.activity))
+	for slot := range s.activity {
+		slots = append(slots, slot)
+	}
+	s.activity = map[int]bool{}
+	s.actMu.Unlock()
+	s.pmu.Lock()
+	multi := s.multi
+	s.pmu.Unlock()
+	if !multi {
+		return
+	}
+	sort.Ints(slots)
+	s.h.push(protocol.EventSlotActivity, protocol.SlotActivity{SessionID: s.ID(), Slots: slots})
 }
 
 // readFrames pumps addon frames into the encoder while exporting. The
@@ -685,13 +1015,31 @@ func (s *Session) readFrames() {
 }
 
 func (s *Session) cleanup() {
-	s.peer.Close() // nil-safe
-	s.peer = nil
+	// Run what was queued before the end: an offer that finished gathering
+	// is closed by installPeer (the context is done) instead of leaking.
+	for drained := false; !drained; {
+		select {
+		case f := <-s.events:
+			s.guard("drain", f)
+		default:
+			drained = true
+		}
+	}
+	for _, ps := range s.peers {
+		ps.closed.Store(true)
+		ps.peer.Close() // nil-safe
+		s.sendLines(ps.in.Release())
+		s.flushDropsFor(ps, true)
+	}
+	s.peers = map[string]*peerState{}
+	if s.mux != nil {
+		s.mux.Close()
+	}
 	if s.enc != nil {
 		s.enc.Stop()
 	}
 	if s.link != nil {
-		s.releaseAll()
+		s.sendLines([]input.Out{{"t": "release_all"}})
 		s.link.Close()
 	}
 	if s.godot != nil {

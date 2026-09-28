@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func h(t *testing.T, tr *Translator, label, msg string) Result {
+func h(t *testing.T, tr *Binding, label, msg string) Result {
 	t.Helper()
 	r, err := tr.Handle(label, []byte(msg))
 	if err != nil {
@@ -18,9 +18,9 @@ func h(t *testing.T, tr *Translator, label, msg string) Result {
 func js(o Out) string { b, _ := json.Marshal(o); return string(b) }
 
 func TestKeyEdgesAndLocations(t *testing.T) {
-	tr := NewTranslator()
+	tr := NewV1Binding()
 	r := h(t, tr, "input-events", `{"t":"key","code":"KeyW","down":true}`)
-	if len(r.Lines) != 1 || js(r.Lines[0]) != `{"e":false,"k":"W","loc":0,"p":true,"t":"key"}` || !r.Activity {
+	if len(r.Lines) != 1 || js(r.Lines[0]) != `{"d":0,"e":false,"k":"W","loc":0,"p":true,"t":"key"}` || !r.Activity {
 		t.Fatalf("down: %+v", r)
 	}
 	if r := h(t, tr, "input-events", `{"t":"key","code":"KeyW","down":true}`); len(r.Lines) != 0 {
@@ -66,7 +66,7 @@ func padMsg(seq int, buttons []float64, axes []float64) string {
 }
 
 func TestPadDiffEdgesOnly(t *testing.T) {
-	tr := NewTranslator()
+	tr := NewV1Binding()
 	zeros := make([]float64, 17)
 	if r := h(t, tr, "input-state", padMsg(1, zeros, []float64{0, 0, 0, 0})); len(r.Lines) != 0 || r.Activity {
 		t.Fatalf("idle snapshot emitted %+v", r)
@@ -111,7 +111,7 @@ func TestPadDiffEdgesOnly(t *testing.T) {
 }
 
 func TestReleaseAllAndDisconnect(t *testing.T) {
-	tr := NewTranslator()
+	tr := NewV1Binding()
 	h(t, tr, "input-events", `{"t":"key","code":"KeyA","down":true}`)
 	b := make([]float64, 17)
 	b[1] = 1
@@ -122,7 +122,7 @@ func TestReleaseAllAndDisconnect(t *testing.T) {
 		s = append(s, js(l))
 	}
 	want := []string{
-		`{"e":false,"k":"A","loc":0,"p":false,"t":"key"}`,
+		`{"d":0,"e":false,"k":"A","loc":0,"p":false,"t":"key"}`,
 		`{"b":1,"d":0,"p":false,"t":"jb","v":0}`,
 		`{"a":1,"d":0,"t":"ja","v":0}`,
 		`{"t":"release_all"}`,
@@ -142,29 +142,33 @@ func TestReleaseAllAndDisconnect(t *testing.T) {
 	}
 }
 
-func TestSlotsAndUnknown(t *testing.T) {
-	tr := NewTranslator()
-	if _, err := tr.Handle("input-events", []byte(`{"t":"key","code":"KeyA","down":true,"slot":1}`)); err == nil {
-		t.Fatal("slot 1 accepted in single-player v1")
-	}
-	old := MaxSlots
-	MaxSlots = 2
-	defer func() { MaxSlots = old }()
+// v1 (an old core, no play_slots): the implicit peer's src 0 is slot 0, and
+// a `slot` the browser sends is not read at all (it used to be range-checked
+// against the package-global MaxSlots, which is gone).
+func TestV1BindingAndUnknown(t *testing.T) {
+	tr := NewV1Binding()
 	r, err := tr.Handle("input-state", []byte(pad2(1)))
-	if err != nil || len(r.Lines) != 1 || r.Lines[0]["d"] != 1 {
-		t.Fatalf("slot 1 -> device 1: %+v %v", r, err)
+	if err != nil || len(r.Lines) != 1 || r.Lines[0]["d"] != 0 || r.Slot != 0 {
+		t.Fatalf("v1 slot:1 must bind to slot 0: %+v %v", r, err)
 	}
-	if r, err := tr.Handle("input-events", []byte(`{"t":"mouse","x":1}`)); err != nil || len(r.Lines) != 0 {
+	if r, err := tr.Handle("input-events", []byte(`{"t":"mouse","x":1}`)); err != nil || len(r.Lines) != 0 || r.Dropped != "" {
 		t.Fatalf("unknown type: %+v %v", r, err)
 	}
 	if _, err := tr.Handle("input-events", []byte(`{`)); err == nil {
 		t.Fatal("bad json accepted")
 	}
-	if r := h(t, tr, "input-events", `{"t":"probe","seq":7}`); js(r.Lines[0]) != `{"seq":7,"t":"probe"}` {
+	// v1 forwards the probe seq unchanged, all 12 bits.
+	if r := h(t, tr, "input-events", `{"t":"probe","seq":4000}`); js(r.Lines[0]) != `{"seq":4000,"t":"probe"}` {
 		t.Fatalf("probe: %+v", r)
 	}
+	// A src the v1 table does not hold is dropped, like any unbound src.
+	if r := h(t, tr, "input-events", `{"t":"key","code":"KeyA","down":true,"src":1}`); r.Dropped != DropNoSlot || len(r.Lines) != 0 {
+		t.Fatalf("v1 src 1: %+v", r)
+	}
+	if lines := tr.SetSlots(map[int]int{}); lines != nil || len(tr.Slots()) != 1 {
+		t.Fatalf("a v1 binding must ignore play_slots: %v %v", lines, tr.Slots())
+	}
 }
-
 func pad2(slot int) string {
 	b := make([]float64, 17)
 	b[3] = 1
