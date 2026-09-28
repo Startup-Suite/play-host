@@ -11,7 +11,14 @@ extends Node
 ##     {"t":"release","d":0}  releases what device d holds
 ##     {"t":"release_all"}  {"t":"probe","seq":N}  {"t":"export","on":true}
 ## d is the player SLOT the host bound the input to (P1 = 0), never a value
-## the browser chose. A key line without d is device 0 (a v1 host).
+## the browser chose. A key line without d is slot 0 (a v1 host).
+##
+## Device ids (task 01a0dbd6, measured on Godot 4.7.2): a key event's default
+## device is 16 (the keyboard id), and the built-in ui_* actions are bound to
+## device 16, so a key event with device 0 does NOT match ui_accept. So keys
+## from slot d carry device <default> + d (P1 keeps the default, exactly what
+## a v1 key had, so every InputMap action still fires for P1), and pads carry
+## device d. Every event also carries meta "suite_play_slot" = d.
 ##   game -> host: frames while export is on (frame path C, stage 1).
 ## Frame record (little-endian): "SPF1", u32 width, u32 height, u32 kind
 ## (1 = Image.FORMAT_RGBA8 from get_image, 2 = RD texture bytes), u32 length, bytes.
@@ -26,17 +33,21 @@ extends Node
 ## A multi-player host forwards seq = slot << 10 | (seq & 0x3FF), so the top 2
 ## bits name the slot; this file draws whatever seq it is given.
 ##
-## For games (task 01a0dbd6, recorded for Voltron): every event this addon
-## parses carries event.device = the slot. KEY POLLING has no device:
+## For games (task 01a0dbd6, recorded for Voltron): the slot of any event is
+## event.get_meta("suite_play_slot", 0); for a key it is also
+## event.device - 16, for a pad event.device. KEY POLLING has no device:
 ## Input.is_physical_key_pressed / is_key_pressed / is_action_pressed are
 ## global, so two keyboard players are distinct ONLY in _input /
-## _unhandled_input via event.device. Pads are distinct by polling too,
-## through Input.get_joy_axis(d, ...) and is_joy_button_pressed(d, ...).
+## _unhandled_input. An action bound to device 16 (the ui_* defaults) fires
+## for P1's keys only; an action set to "All Devices" fires for every slot.
+## Pads are distinct by polling too, through Input.get_joy_axis(d, ...) and
+## is_joy_button_pressed(d, ...).
 
 const CELLS := 4
 const CELL_PX := 16
 const PROBE_FRAMES := 2
 const MAX_SEQ := 4095
+const SLOT_META := &"suite_play_slot"
 
 var session_id := ""
 var port := 0
@@ -187,11 +198,7 @@ func _key(name: String, loc: int, pressed: bool, echo: bool, device: int = 0) ->
 	var code := keycode_for(name)
 	if code == KEY_NONE:
 		return
-	var ev := InputEventKey.new()
-	ev.device = device
-	ev.keycode = code
-	ev.physical_keycode = code
-	ev.location = loc
+	var ev := _key_event(code, loc, device)
 	ev.pressed = pressed
 	ev.echo = echo
 	var id := "%d:%d:%d" % [device, code, loc]
@@ -206,9 +213,21 @@ func _key(name: String, loc: int, pressed: bool, echo: bool, device: int = 0) ->
 		print("suite_play: first key %s pressed=%s -> Input.is_physical_key_pressed=%s" % [name, pressed, Input.is_physical_key_pressed(code)])
 
 
+## A key event for slot `slot`: the default key device + slot, slot in meta.
+static func _key_event(code: int, loc: int, slot: int) -> InputEventKey:
+	var ev := InputEventKey.new()
+	ev.device += slot
+	ev.keycode = code
+	ev.physical_keycode = code
+	ev.location = loc
+	ev.set_meta(SLOT_META, slot)
+	return ev
+
+
 func _joy_button(device: int, button: int, pressed: bool, value: float) -> void:
 	var ev := InputEventJoypadButton.new()
 	ev.device = device
+	ev.set_meta(SLOT_META, device)
 	ev.button_index = button
 	ev.pressed = pressed
 	ev.pressure = value
@@ -223,6 +242,7 @@ func _joy_button(device: int, button: int, pressed: bool, value: float) -> void:
 func _joy_axis(device: int, axis: int, value: float) -> void:
 	var ev := InputEventJoypadMotion.new()
 	ev.device = device
+	ev.set_meta(SLOT_META, device)
 	ev.axis = axis
 	ev.axis_value = value
 	var id := "%d:%d" % [device, axis]
@@ -254,11 +274,7 @@ func _release(device: int) -> void:
 		var k: Array = _held_keys[id]
 		if device >= 0 and k[2] != device:
 			continue
-		var ev := InputEventKey.new()
-		ev.device = k[2]
-		ev.keycode = k[0]
-		ev.physical_keycode = k[0]
-		ev.location = k[1]
+		var ev := _key_event(k[0], k[1], k[2])
 		ev.pressed = false
 		Input.parse_input_event(ev)
 		_held_keys.erase(id)
@@ -268,6 +284,7 @@ func _release(device: int) -> void:
 			continue
 		var ev := InputEventJoypadButton.new()
 		ev.device = b[0]
+		ev.set_meta(SLOT_META, b[0])
 		ev.button_index = b[1]
 		ev.pressed = false
 		Input.parse_input_event(ev)
@@ -278,6 +295,7 @@ func _release(device: int) -> void:
 			continue
 		var ev := InputEventJoypadMotion.new()
 		ev.device = a[0]
+		ev.set_meta(SLOT_META, a[0])
 		ev.axis = a[1]
 		ev.axis_value = 0.0
 		Input.parse_input_event(ev)

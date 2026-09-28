@@ -22,6 +22,10 @@
 //	{"t":"release","d":0}   releases what device d holds (multi-peer)
 //	{"t":"release_all"}  {"t":"probe","seq":N}  {"t":"export","on":true}
 //
+// The addon puts slot d's keys on InputEvent device <default key device> + d
+// (16 + d in Godot 4.7, so P1's keys keep the device the built-in ui_*
+// actions are bound to) and its pad events on device d; see suite_play.gd.
+//
 // SLOTS ARE HOST-HELD (task 01a0dbd6). `src` is the browser's local
 // controller ordinal (0 = keyboard and the first pad; absent means 0). The
 // player slot, which becomes the Godot device index `d`, comes ONLY from the
