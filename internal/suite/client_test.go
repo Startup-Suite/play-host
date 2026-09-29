@@ -28,6 +28,17 @@ type fakeCore struct {
 	conns    []*websocket.Conn
 	beats    int
 	answerHB bool
+	// wmu serialises the fake server's writes: its read loop answers
+	// frames while broadcast writes from the test goroutine, and gorilla
+	// allows one concurrent writer (the -race failure stage 3 recorded as
+	// pre-existing; fixed in 01a0dbd6 stage 6).
+	wmu sync.Mutex
+}
+
+func (f *fakeCore) write(c *websocket.Conn, b []byte) {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+	_ = c.WriteMessage(websocket.TextMessage, b)
 }
 
 func (f *fakeCore) handler() http.Handler {
@@ -66,7 +77,7 @@ func (f *fakeCore) handler() http.Handler {
 				f.joins = append(f.joins, p)
 				f.mu.Unlock()
 				out, _ := EncodeFrame(fr.JoinRef, fr.Ref, fr.Topic, "phx_reply", map[string]any{"status": "ok", "response": map[string]any{}})
-				_ = c.WriteMessage(websocket.TextMessage, out)
+				f.write(c, out)
 			case fr.Topic == "phoenix" && fr.Event == "heartbeat":
 				f.mu.Lock()
 				f.beats++
@@ -74,7 +85,7 @@ func (f *fakeCore) handler() http.Handler {
 				f.mu.Unlock()
 				if ans {
 					out, _ := EncodeFrame(nil, fr.Ref, "phoenix", "phx_reply", map[string]any{"status": "ok", "response": map[string]any{}})
-					_ = c.WriteMessage(websocket.TextMessage, out)
+					f.write(c, out)
 				}
 			default:
 				f.mu.Lock()
@@ -90,7 +101,7 @@ func (f *fakeCore) broadcast(event string, payload any) {
 	c := f.conns[len(f.conns)-1]
 	f.mu.Unlock()
 	out, _ := EncodeFrame(nil, nil, "runtime:play-host-test", event, payload)
-	_ = c.WriteMessage(websocket.TextMessage, out)
+	f.write(c, out)
 }
 
 func (f *fakeCore) dropAll() {
