@@ -121,7 +121,7 @@ func serve(args []string) error {
 	defer cancel()
 	cl.Run(ctx)
 	if s := h.Current(); s != nil {
-		h.OnDisconnected(fmt.Errorf("play-host stopping"))
+		h.Shutdown("play-host stopping")
 		time.Sleep(2 * time.Second)
 	}
 	return nil

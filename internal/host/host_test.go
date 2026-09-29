@@ -208,26 +208,43 @@ func (f *fakeStages) Launch(dir string, s protocol.SessionStart, logPath string)
 // core records pushes and lets the test answer the offer like a browser.
 type core struct {
 	mu       sync.Mutex
+	resumes  []protocol.ResumeStatus
 	statuses []protocol.Status
 	signals  []protocol.Signal
 	offer    chan protocol.Signal
+	events   []string // every event name, in order
+	activity []protocol.SlotActivity
 }
 
 func (c *core) Push(event string, payload any) error {
 	b, _ := json.Marshal(payload)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.events = append(c.events, event)
 	switch event {
+	case protocol.EventSlotActivity:
+		var a protocol.SlotActivity
+		json.Unmarshal(b, &a)
+		c.activity = append(c.activity, a)
 	case protocol.EventSessionStatus:
 		var s protocol.Status
 		json.Unmarshal(b, &s)
 		c.statuses = append(c.statuses, s)
+		var r protocol.ResumeStatus
+		if json.Unmarshal(b, &r) == nil && r.Resume {
+			c.resumes = append(c.resumes, r)
+		}
 	case protocol.EventSignal:
 		var s protocol.Signal
 		json.Unmarshal(b, &s)
 		c.signals = append(c.signals, s)
 		if s.Kind == protocol.KindOffer {
-			c.offer <- s
+			// Never block the session loop that pushes (a multi-peer test
+			// reads offers by peer through offersFor instead).
+			select {
+			case c.offer <- s:
+			default:
+			}
 		}
 	}
 	return nil
@@ -279,13 +296,27 @@ func startPayload(id string, idle int) json.RawMessage {
 }
 
 func newTestHost(t *testing.T, port int, stages *fakeStages) (*Host, *core) {
+	return newTestHostLog(t, port, stages, t.Logf)
+}
+
+// muxPort is the one UDP port a test session's peers share (task 01a0dbd6:
+// rtc.NewMuxAPI). It sits below 32768, outside Linux's ephemeral range, so
+// no pion answerer or fake-ffmpeg socket can already hold it (measured on
+// moon: 40366 was taken by an ephemeral socket), and is unique per test port.
+func muxPort(port int) int { return port - 9000 }
+
+// newTestHostLog is newTestHost with the host's log sent to logf.
+func newTestHostLog(t *testing.T, port int, stages *fakeStages, logf func(string, ...any)) (*Host, *core) {
 	exe, _ := os.Executable()
 	t.Setenv("FAKE_FFMPEG", "1")
-	c := &core{offer: make(chan protocol.Signal, 4)}
+	c := &core{offer: make(chan protocol.Signal, 16)}
 	h := New(Config{
-		FFmpeg: exe, LogsDir: t.TempDir(), HostIP: "127.0.0.1", UDPMin: 40360, UDPMax: 40369,
+		FFmpeg: exe, LogsDir: t.TempDir(), HostIP: "127.0.0.1", UDPMin: uint16(muxPort(port)), UDPMax: uint16(muxPort(port)),
 		GodotPort: port, RTPPort: port + 1, ProgressEvery: 20 * time.Millisecond, IdleCheck: 20 * time.Millisecond, LinkTimeout: 5 * time.Second, Loopback: true,
-	}, c, stages, t.Logf)
+		// A dropped suite socket keeps the session this long (stage 6); short,
+		// so the cases that drop the socket to end a session stay fast.
+		ResumeGrace: 50 * time.Millisecond,
+	}, c, stages, logf)
 	return h, c
 }
 
@@ -325,7 +356,8 @@ func viewer(t *testing.T, h *Host, offer protocol.Signal) (*webrtc.PeerConnectio
 	pc.SetLocalDescription(ans)
 	<-g
 	data, _ := json.Marshal(protocol.SessionDescription{Type: "answer", SDP: pc.LocalDescription().SDP})
-	sig, _ := json.Marshal(protocol.Signal{SessionID: offer.SessionID, Kind: protocol.KindAnswer, Data: data})
+	// Core tags the answer with the peer the offer was for (empty for v1).
+	sig, _ := json.Marshal(protocol.Signal{SessionID: offer.SessionID, Kind: protocol.KindAnswer, Data: data, PeerID: offer.PeerID})
 	h.OnEvent(protocol.EventSignal, sig)
 	return pc, dcs, &pkts
 }
@@ -411,8 +443,8 @@ func TestBuildingProgressAndFailures(t *testing.T) {
 	if !strings.Contains(c.last("b1").Detail, "Importing") {
 		t.Errorf("progress detail %q", c.last("b1").Detail)
 	}
-	// A disconnect from core tears the session down without a status (the
-	// socket is gone; core already failed it).
+	// A disconnect from core that is not followed by a rejoin within the
+	// resume grace tears the session down without a status.
 	h.OnDisconnected(fmt.Errorf("test drop"))
 	eventually(t, "session slot freed", func() bool { return h.Current() == nil })
 	if c.last("b1").State != protocol.StateBuilding {

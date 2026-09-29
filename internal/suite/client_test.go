@@ -28,6 +28,17 @@ type fakeCore struct {
 	conns    []*websocket.Conn
 	beats    int
 	answerHB bool
+	// wmu serialises the fake server's writes: its read loop answers
+	// frames while broadcast writes from the test goroutine, and gorilla
+	// allows one concurrent writer (the -race failure stage 3 recorded as
+	// pre-existing; fixed in 01a0dbd6 stage 6).
+	wmu sync.Mutex
+}
+
+func (f *fakeCore) write(c *websocket.Conn, b []byte) {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+	_ = c.WriteMessage(websocket.TextMessage, b)
 }
 
 func (f *fakeCore) handler() http.Handler {
@@ -66,7 +77,7 @@ func (f *fakeCore) handler() http.Handler {
 				f.joins = append(f.joins, p)
 				f.mu.Unlock()
 				out, _ := EncodeFrame(fr.JoinRef, fr.Ref, fr.Topic, "phx_reply", map[string]any{"status": "ok", "response": map[string]any{}})
-				_ = c.WriteMessage(websocket.TextMessage, out)
+				f.write(c, out)
 			case fr.Topic == "phoenix" && fr.Event == "heartbeat":
 				f.mu.Lock()
 				f.beats++
@@ -74,7 +85,7 @@ func (f *fakeCore) handler() http.Handler {
 				f.mu.Unlock()
 				if ans {
 					out, _ := EncodeFrame(nil, fr.Ref, "phoenix", "phx_reply", map[string]any{"status": "ok", "response": map[string]any{}})
-					_ = c.WriteMessage(websocket.TextMessage, out)
+					f.write(c, out)
 				}
 			default:
 				f.mu.Lock()
@@ -90,7 +101,7 @@ func (f *fakeCore) broadcast(event string, payload any) {
 	c := f.conns[len(f.conns)-1]
 	f.mu.Unlock()
 	out, _ := EncodeFrame(nil, nil, "runtime:play-host-test", event, payload)
-	_ = c.WriteMessage(websocket.TextMessage, out)
+	f.write(c, out)
 }
 
 func (f *fakeCore) dropAll() {
@@ -171,7 +182,10 @@ func TestJoinDeclaresFeatureAndRoutesBroadcasts(t *testing.T) {
 	ci := fc.joins[0]["client_info"].(map[string]any)
 	fc.mu.Unlock()
 	feats := ci["features"].([]any)
-	if len(feats) != 1 || feats[0] != "game_stream_host" || ci["product"] != "play-host" {
+	// game_stream_multi is what makes core send play_peer_open (task
+	// 01a0dbd6): without it core keeps v1 wiring and never asks for a fresh
+	// offer on a same-page re-attach.
+	if len(feats) != 2 || feats[0] != "game_stream_host" || feats[1] != "game_stream_multi" || ci["product"] != "play-host" {
 		t.Fatalf("client_info %v", ci)
 	}
 
@@ -292,5 +306,30 @@ func TestJitterBounds(t *testing.T) {
 		if j < 500*time.Millisecond || j >= time.Second {
 			t.Fatalf("jitter %s", j)
 		}
+	}
+}
+
+// Stage 6 (01a0dbd6): a heartbeat whose WRITE waited behind other writes for
+// longer than an interval used to be declared missed on the ticker's
+// buffered tick, microseconds after it went out, closing a healthy socket.
+// The write lock is held here for 1.6 intervals (standing in for a long
+// write; under the 3-interval read deadline), and core answers every beat:
+// the socket must stay up.
+func TestALateHeartbeatWriteIsNotAMissedReply(t *testing.T) {
+	fc, rec, c, _ := setup(t, 50*time.Millisecond, true)
+	wait(t, rec.connected, "join")
+	time.Sleep(120 * time.Millisecond) // a couple of answered beats first
+	c.mu.Lock()
+	time.Sleep(80 * time.Millisecond)
+	c.mu.Unlock()
+	select {
+	case err := <-rec.dropped:
+		t.Fatalf("a healthy socket was dropped after a late heartbeat write: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.beats < 3 {
+		t.Fatalf("only %d beats", fc.beats)
 	}
 }

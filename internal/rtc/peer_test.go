@@ -1,6 +1,7 @@
 package rtc
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -140,5 +141,84 @@ func TestCloseIsNilSafeAndIdempotent(t *testing.T) {
 	p.Close()
 	if done != 1 {
 		t.Fatalf("OnDone fired %d times", done)
+	}
+}
+
+// Task 01a0dbd6: four peers on one NewMuxAPI hold ONE UDP port between
+// them. Each connects and delivers data, and every selected pair's local
+// port is PortMin; the mux listens on exactly one address.
+func TestFourPeersShareOneMuxedPort(t *testing.T) {
+	const port = 31370 // below 32768: outside Linux's ephemeral range
+	cfg := Config{PortMin: port, PortMax: port + 9, AllowIPs: []net.IP{net.ParseIP("127.0.0.1")}, IncludeLoopback: true}
+	api, mux, err := NewMuxAPI(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	if addrs := MuxAddrs(mux); len(addrs) != 1 || addrs[0].String() != "127.0.0.1:31370" {
+		t.Fatalf("mux listens on %v", addrs)
+	}
+	track, _ := NewVideoTrackRTP()
+	se := webrtc.SettingEngine{}
+	se.SetIncludeLoopbackCandidate(true)
+	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	vapi := webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	type pair struct {
+		host *Peer
+		got  chan string
+	}
+	var peers []pair
+	for i := 0; i < 4; i++ {
+		got := make(chan string, 1)
+		connected := make(chan struct{}, 1)
+		host, offer, err := NewPeer(api, cfg, track, Callbacks{
+			OnData:      func(label string, data []byte) { got <- string(data) },
+			OnConnected: func() { connected <- struct{}{} },
+		})
+		if err != nil {
+			t.Fatalf("peer %d: %v", i, err)
+		}
+		defer host.Close()
+		viewer, err := vapi.NewPeerConnection(webrtc.Configuration{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer viewer.Close()
+		msg := fmt.Sprintf(`{"t":"probe","seq":%d}`, i+1)
+		viewer.OnDataChannel(func(dc *webrtc.DataChannel) {
+			if dc.Label() == LabelInputEvents {
+				dc.OnOpen(func() { _ = dc.SendText(msg) })
+			}
+		})
+		if err := viewer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
+			t.Fatal(err)
+		}
+		ans, _ := viewer.CreateAnswer(nil)
+		g := webrtc.GatheringCompletePromise(viewer)
+		_ = viewer.SetLocalDescription(ans)
+		<-g
+		if err := host.SetAnswer(viewer.LocalDescription().SDP); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-connected:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("peer %d never connected", i)
+		}
+		peers = append(peers, pair{host, got})
+	}
+	for i, p := range peers {
+		select {
+		case m := <-p.got:
+			if m != fmt.Sprintf(`{"t":"probe","seq":%d}`, i+1) {
+				t.Fatalf("peer %d got %q (crossed ufrags?)", i, m)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("peer %d: no data", i)
+		}
+		f := strings.Fields(p.host.SelectedPair())
+		if len(f) < 2 || f[1] != "127.0.0.1:31370" {
+			t.Fatalf("peer %d selected %q, want local 127.0.0.1:31370", i, p.host.SelectedPair())
+		}
 	}
 }

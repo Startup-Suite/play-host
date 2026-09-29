@@ -2,12 +2,20 @@
 // runtime websocket: `wss://<host>/runtime/ws` authenticated with
 // runtime_id + token (PlatformWeb.RuntimeSocket.connect/3), joining
 // `runtime:<runtime_id>` (PlatformWeb.RuntimeChannel.join/3) with
-// client_info.features = ["game_stream_host"], the declaration
-// Platform.GameStream discovers hosts by.
+// client_info.features = ["game_stream_host", "game_stream_multi"]: the first
+// is the declaration Platform.GameStream discovers hosts by, the second tells
+// core this host speaks the multi-peer frames (task 01a0dbd6: play_peer_open,
+// play_peer_close, play_slots, play_slot_activity, peer_id on play_signal).
 //
 // Frames are v2 arrays: [join_ref, ref, topic, event, payload]. The client
-// heartbeats on the "phoenix" topic, treats a missed heartbeat reply as a
-// dead socket, and reconnects with capped exponential backoff and jitter.
+// heartbeats on the "phoenix" topic, treats a heartbeat not answered within
+// one interval of being written as a dead socket, and reconnects with
+// capped exponential backoff and jitter.
+//
+// Every write goes through Client.write, under one mutex: gorilla allows one
+// concurrent writer, and nothing else writes to the conn (no WriteControl,
+// no ping handler that writes). The Dialer's write buffer is 64 KiB, so a
+// signalling frame is one websocket frame (legal either way).
 //
 // The token is read from a FILE on every connect (so a rotated token is
 // picked up without a restart) and is never logged: it travels only in the
@@ -34,13 +42,19 @@ import (
 // Feature is the client_info.features entry that marks a play host.
 const Feature = "game_stream_host"
 
+// FeatureMulti declares the multi-peer frames (core Protocol.multi_feature/0).
+// Core sends play_peer_open, play_peer_close and play_slots only to a host
+// that declares it, and otherwise keeps v1 single-peer wiring.
+const FeatureMulti = "game_stream_multi"
+
 // Handler receives broadcasts pushed on the runtime topic.
 type Handler interface {
 	// OnEvent is called for every server push on runtime:<id> other than
 	// phx_reply / phx_error / phx_close. It must not block for long.
 	OnEvent(event string, payload json.RawMessage)
 	// OnConnected is called after a successful join; OnDisconnected when the
-	// socket drops (core fails any session the host held when that happens).
+	// socket drops. Core waits a grace window for the host to rejoin and
+	// resume a running session (protocol "Resume", task 01a0dbd6 stage 6).
 	OnConnected()
 	OnDisconnected(err error)
 }
@@ -53,11 +67,28 @@ type Config struct {
 	Product    string // client_info.product; core stores unknown products as "unknown"
 	Version    string
 	Build      string
-	Heartbeat  time.Duration // default 30s
+	Heartbeat  time.Duration // default 10s
 	BackoffMin time.Duration // default 1s
 	BackoffMax time.Duration // default 30s
 	Logf       func(format string, args ...any)
+	// Features replaces client_info.features (nil = the play host's
+	// [Feature, FeatureMulti]). Only the stress tool sets it.
+	Features []string
+	// WriteBufferSize is the websocket Dialer's write buffer (0 =
+	// DefaultWriteBufferSize). gorilla sends a message larger than it as a
+	// FRAGMENTED message; at its own default of 4096 bytes, most offers (about
+	// 4-7 KB of SDP) went out in two frames.
+	WriteBufferSize int
 }
+
+// DefaultWriteBufferSize makes every signalling frame the host sends (core
+// caps play_signal data at 64 KiB) go out as a single websocket frame. It
+// is tidiness, NOT the fix for task 01a0dbd6 stage 6's broken sockets:
+// fragmented messages are legal and Bandit reassembled all 150 captured on
+// one socket. Those breaks were bytes corrupted between moon's NIC and the
+// dev core container, by podman's rootlessport; the 64 KiB buffer does not
+// prevent that (docs/multiplayer-01a0dbd6.md, "Stage 6").
+const DefaultWriteBufferSize = 64 << 10
 
 // Client is one logical connection that reconnects forever until ctx ends.
 type Client struct {
@@ -69,12 +100,27 @@ type Client struct {
 	joinRef string
 	ref     int
 	started time.Time
+	wr      writeStats // this socket's writes, logged when it drops
+}
+
+// writeStats describe one socket's writes, so a drop's log line says what
+// the host had just sent (task 01a0dbd6 stage 6: two drops were diagnosed
+// from core's side only).
+type writeStats struct {
+	n, bytes  int64
+	lastEvent string
+	lastBytes int
+	lastAt    time.Time
+	lastTook  time.Duration
 }
 
 // New builds a client. Run starts it.
 func New(cfg Config, h Handler) *Client {
 	if cfg.Heartbeat == 0 {
-		cfg.Heartbeat = 30 * time.Second
+		// Stage 6 (01a0dbd6): 10 s, not 30 s. A socket that stops carrying
+		// the host's frames is found in 10-20 s instead of 30-60 s (the review
+		// measured a 51 s stall), and the session resumes on a new socket.
+		cfg.Heartbeat = 10 * time.Second
 	}
 	if cfg.BackoffMin == 0 {
 		cfg.BackoffMin = time.Second
@@ -87,6 +133,9 @@ func New(cfg Config, h Handler) *Client {
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
+	}
+	if cfg.WriteBufferSize == 0 {
+		cfg.WriteBufferSize = DefaultWriteBufferSize
 	}
 	return &Client{cfg: cfg, h: h, started: time.Now().UTC()}
 }
@@ -138,7 +187,7 @@ func ReadToken(path string) (string, error) {
 func (c *Client) JoinPayload() map[string]any {
 	ci := map[string]any{
 		"product":    c.cfg.Product,
-		"features":   []string{Feature},
+		"features":   c.features(),
 		"started_at": c.started.Format(time.RFC3339),
 	}
 	if c.cfg.Version != "" {
@@ -148,6 +197,13 @@ func (c *Client) JoinPayload() map[string]any {
 		ci["build"] = c.cfg.Build
 	}
 	return map[string]any{"client_info": ci}
+}
+
+func (c *Client) features() []string {
+	if c.cfg.Features != nil {
+		return c.cfg.Features
+	}
+	return []string{Feature, FeatureMulti}
 }
 
 // Run connects, joins and pumps until ctx is done, reconnecting with backoff.
@@ -240,12 +296,17 @@ func (c *Client) write(conn *websocket.Conn, joinRef *string, topic, event strin
 		return "", err
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return ref, conn.WriteMessage(websocket.TextMessage, b)
+	t0 := time.Now()
+	err = conn.WriteMessage(websocket.TextMessage, b)
+	c.wr.n++
+	c.wr.bytes += int64(len(b))
+	c.wr.lastEvent, c.wr.lastBytes, c.wr.lastAt, c.wr.lastTook = event, len(b), t0, time.Since(t0)
+	return ref, err
 }
 
 // Push sends event on the runtime topic. It fails when not joined; the
-// caller decides whether that matters (core fails the session on a
-// disconnect anyway).
+// caller decides whether that matters (a session kept through a drop
+// re-sends its state when it resumes).
 func (c *Client) Push(event string, payload any) error {
 	c.mu.Lock()
 	conn, jr := c.conn, c.joinRef
@@ -273,7 +334,7 @@ func (c *Client) session(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	d := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	d := websocket.Dialer{HandshakeTimeout: 15 * time.Second, WriteBufferSize: c.cfg.WriteBufferSize}
 	conn, resp, err := d.DialContext(ctx, u, nil)
 	if err != nil {
 		// Never wrap err with u: the URL carries the token.
@@ -296,6 +357,7 @@ func (c *Client) session(ctx context.Context) error {
 	// Join.
 	c.mu.Lock()
 	c.ref = 0
+	c.wr = writeStats{}
 	c.mu.Unlock()
 	joinRef, err := c.write(conn, nil, c.Topic(), "phx_join", c.JoinPayload(), true)
 	if err != nil {
@@ -334,10 +396,20 @@ func (c *Client) session(ctx context.Context) error {
 	c.cfg.Logf("suite: joined %s as %s", c.Topic(), c.cfg.Product)
 	c.h.OnConnected()
 
-	// Heartbeat: a reply must arrive before the next beat.
+	// Heartbeat: a reply must arrive by the next tick, unless the beat was
+	// WRITTEN less than half an interval before that tick. Stage 6
+	// (01a0dbd6): the check used to be "a reply before the next tick" alone,
+	// and a beat whose write waited behind other writes for longer than an
+	// interval was declared missed on the ticker's buffered tick,
+	// microseconds after it went out, closing a healthy socket.
+	// A reply can also beat the goroutine that wrote the beat back to hbMu
+	// (loopback, or that goroutine descheduled after the write): `early`
+	// holds the last reply ref that matched no pending beat, so the beat is
+	// not then recorded as pending forever (the same stage-6 review).
 	hbErr := make(chan error, 1)
 	var hbMu sync.Mutex
-	pending := ""
+	pending, early := "", ""
+	var sentAt time.Time
 	go func() {
 		t := time.NewTicker(c.cfg.Heartbeat)
 		defer t.Stop()
@@ -347,10 +419,13 @@ func (c *Client) session(ctx context.Context) error {
 				return
 			case <-t.C:
 				hbMu.Lock()
-				missed := pending != ""
+				waiting, age := pending != "", time.Since(sentAt)
 				hbMu.Unlock()
-				if missed {
-					hbErr <- errors.New("heartbeat reply missed")
+				if waiting && age < c.cfg.Heartbeat/2 {
+					continue // the beat in flight went out late, just now: give it a tick
+				}
+				if waiting {
+					hbErr <- fmt.Errorf("heartbeat reply missed (%s after the beat)", age.Round(time.Millisecond))
 					conn.Close()
 					return
 				}
@@ -361,7 +436,9 @@ func (c *Client) session(ctx context.Context) error {
 					return
 				}
 				hbMu.Lock()
-				pending = ref
+				if early != ref {
+					pending, sentAt = ref, time.Now()
+				}
 				hbMu.Unlock()
 			}
 		}
@@ -383,8 +460,12 @@ func (c *Client) session(ctx context.Context) error {
 		switch {
 		case f.Topic == "phoenix" && f.Event == "phx_reply":
 			hbMu.Lock()
-			if f.Ref != nil && *f.Ref == pending {
+			switch {
+			case f.Ref == nil:
+			case *f.Ref == pending:
 				pending = ""
+			default:
+				early = *f.Ref
 			}
 			hbMu.Unlock()
 		case f.Topic != c.Topic():
@@ -403,6 +484,13 @@ func (c *Client) session(ctx context.Context) error {
 	case e := <-hbErr:
 		readErr = e
 	default:
+	}
+	c.mu.Lock()
+	wr := c.wr
+	c.mu.Unlock()
+	if wr.n > 0 {
+		c.cfg.Logf("suite: socket dropped after %d writes (%d bytes); the last was %s, %d bytes, written %s before the drop in %s",
+			wr.n, wr.bytes, wr.lastEvent, wr.lastBytes, time.Since(wr.lastAt).Round(time.Millisecond), wr.lastTook.Round(time.Microsecond))
 	}
 	c.h.OnDisconnected(readErr)
 	return readErr
