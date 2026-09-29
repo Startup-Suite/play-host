@@ -80,7 +80,18 @@ type Config struct {
 	OfferBackoff  time.Duration
 	// PionLog receives pion's ICE warnings and errors (play-host.log on wave).
 	PionLog io.Writer
+	// ResumeGrace is how long a running session survives a dropped suite
+	// socket (0 = DefaultResumeGrace, negative = end at once, the pre-stage-6
+	// behaviour). The viewers' media never passes through core, so they keep
+	// watching while the socket reconnects; see protocol "Resume".
+	ResumeGrace time.Duration
 }
+
+// DefaultResumeGrace bounds a suite reconnect that keeps the session. Core's
+// own grace (config :platform, :game_stream_host_grace_ms) is shorter, so a
+// host whose core already failed the session is not kept waiting past it for
+// nothing more than a few seconds.
+const DefaultResumeGrace = 30 * time.Second
 
 // Sender pushes host -> core frames.
 type Sender interface {
@@ -111,6 +122,11 @@ type Host struct {
 
 	mu  sync.Mutex
 	cur *Session
+	// away is the session kept through a dropped suite socket, and awayGen
+	// names the grace timer that may still end it (a newer drop or a rejoin
+	// bumps it, so a stale timer does nothing).
+	away    *Session
+	awayGen int
 }
 
 // New builds an engine. stages nil means the real git + Godot stages.
@@ -135,6 +151,9 @@ func New(cfg Config, send Sender, stages Stages, logf func(string, ...any)) *Hos
 	}
 	if cfg.OfferBackoff <= 0 {
 		cfg.OfferBackoff = 500 * time.Millisecond
+	}
+	if cfg.ResumeGrace == 0 {
+		cfg.ResumeGrace = DefaultResumeGrace
 	}
 	h := &Host{cfg: cfg, send: send, logf: logf}
 	if stages == nil {
@@ -165,16 +184,67 @@ func (h *Host) SweepCheckouts(ctx context.Context) {
 	}
 }
 
-// OnConnected implements suite.Handler.
-func (h *Host) OnConnected() { h.logf("host: joined; ready for play_session_start") }
-
-// OnDisconnected implements suite.Handler. Core fails the session the
-// moment the channel drops ("The play host disconnected"), so the host
-// tears its side down too rather than stream to a session nobody can reach.
-func (h *Host) OnDisconnected(err error) {
-	if s := h.Current(); s != nil {
-		s.stop(fmt.Sprintf("suite connection lost: %v", err), false)
+// OnConnected implements suite.Handler. A session kept through a dropped
+// socket (OnDisconnected) is resumed: it tells core it is still running and
+// which peers it holds, and re-offers every peer that is not connected (its
+// offer or answer may have been lost with the socket).
+func (h *Host) OnConnected() {
+	h.logf("host: joined; ready for play_session_start")
+	h.mu.Lock()
+	s := h.away
+	h.away = nil
+	h.awayGen++
+	h.mu.Unlock()
+	if s != nil && s == h.Current() {
+		s.resume()
 	}
+}
+
+// Shutdown ends the running session at once (the process is stopping). No
+// status is sent: the socket is going away with the process.
+func (h *Host) Shutdown(reason string) {
+	h.mu.Lock()
+	h.away = nil
+	h.awayGen++
+	h.mu.Unlock()
+	if s := h.Current(); s != nil {
+		s.stop(reason, false)
+	}
+}
+
+// OnDisconnected implements suite.Handler. Stage 6 (01a0dbd6): the session
+// is NOT ended at once. It is kept for ResumeGrace while the client
+// reconnects (it does so by itself, with backoff); only if the socket is not
+// back by then does the host tear its side down. Before this, one link blip
+// ("websocket: close 1002", or a missed heartbeat) ended every viewer's
+// session.
+func (h *Host) OnDisconnected(err error) {
+	s := h.Current()
+	if s == nil {
+		return
+	}
+	grace := h.cfg.ResumeGrace
+	if grace < 0 {
+		s.stop(fmt.Sprintf("suite connection lost: %v", err), false)
+		return
+	}
+	h.mu.Lock()
+	h.away = s
+	h.awayGen++
+	gen := h.awayGen
+	h.mu.Unlock()
+	s.logf("suite connection lost (%v): keeping the session %s for the reconnect", err, grace)
+	time.AfterFunc(grace, func() {
+		h.mu.Lock()
+		expired := h.awayGen == gen && h.away == s
+		if expired {
+			h.away = nil
+		}
+		h.mu.Unlock()
+		if expired {
+			s.stop(fmt.Sprintf("suite connection lost: %v (not back within %s)", err, grace), false)
+		}
+	})
 }
 
 // OnEvent implements suite.Handler.
@@ -306,6 +376,7 @@ type Session struct {
 
 	mu       sync.Mutex
 	state    string
+	detail   string // the last non-terminal status detail (resume re-sends it)
 	endState string
 	endWhy   string
 	report   bool // send the terminal status (false when the socket is gone)
@@ -394,7 +465,7 @@ func (s *Session) status(state, detail string) {
 		s.mu.Unlock()
 		return
 	}
-	s.state = state
+	s.state, s.detail = state, detail
 	s.mu.Unlock()
 	s.logf("status %s: %s", state, detail)
 	s.h.push(protocol.EventSessionStatus, protocol.NewStatus(s.ID(), state, detail, s.elapsed()))
@@ -408,6 +479,39 @@ func (s *Session) stop(reason string, report bool) {
 	}
 	s.mu.Unlock()
 	s.stopF()
+}
+
+// resume runs after the suite socket rejoined while this session was kept
+// (Host.OnConnected). On the loop: one resume status with the current state
+// and the peers held, then a fresh offer for every peer that is not
+// connected. Connected peers are left alone, so their video never stopped.
+func (s *Session) resume() {
+	s.post(func() {
+		s.mu.Lock()
+		state, detail, over := s.state, s.detail, s.endState != "" || protocol.Terminal(s.state)
+		s.mu.Unlock()
+		if over || state == "" {
+			return
+		}
+		ids := make([]string, 0, len(s.peers))
+		var reoffer []*peerState
+		for id, ps := range s.peers {
+			if id != "" {
+				ids = append(ids, id)
+			}
+			if !ps.connected {
+				reoffer = append(reoffer, ps)
+			}
+		}
+		sort.Strings(ids)
+		s.logf("suite reconnected: resuming %s with %d peer(s), re-offering %d", state, len(s.peers), len(reoffer))
+		s.h.push(protocol.EventSessionStatus, protocol.NewResumeStatus(protocol.NewStatus(s.ID(), state, detail, s.elapsed()), ids))
+		for _, ps := range reoffer {
+			if s.peers[ps.id] == ps {
+				s.openPeer(ps.id, ps.seq)
+			}
+		}
+	})
 }
 
 func (s *Session) fail(detail string) {

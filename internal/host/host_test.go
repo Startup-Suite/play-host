@@ -208,6 +208,7 @@ func (f *fakeStages) Launch(dir string, s protocol.SessionStart, logPath string)
 // core records pushes and lets the test answer the offer like a browser.
 type core struct {
 	mu       sync.Mutex
+	resumes  []protocol.ResumeStatus
 	statuses []protocol.Status
 	signals  []protocol.Signal
 	offer    chan protocol.Signal
@@ -229,6 +230,10 @@ func (c *core) Push(event string, payload any) error {
 		var s protocol.Status
 		json.Unmarshal(b, &s)
 		c.statuses = append(c.statuses, s)
+		var r protocol.ResumeStatus
+		if json.Unmarshal(b, &r) == nil && r.Resume {
+			c.resumes = append(c.resumes, r)
+		}
 	case protocol.EventSignal:
 		var s protocol.Signal
 		json.Unmarshal(b, &s)
@@ -308,6 +313,9 @@ func newTestHostLog(t *testing.T, port int, stages *fakeStages, logf func(string
 	h := New(Config{
 		FFmpeg: exe, LogsDir: t.TempDir(), HostIP: "127.0.0.1", UDPMin: uint16(muxPort(port)), UDPMax: uint16(muxPort(port)),
 		GodotPort: port, RTPPort: port + 1, ProgressEvery: 20 * time.Millisecond, IdleCheck: 20 * time.Millisecond, LinkTimeout: 5 * time.Second, Loopback: true,
+		// A dropped suite socket keeps the session this long (stage 6); short,
+		// so the cases that drop the socket to end a session stay fast.
+		ResumeGrace: 50 * time.Millisecond,
 	}, c, stages, logf)
 	return h, c
 }
@@ -435,8 +443,8 @@ func TestBuildingProgressAndFailures(t *testing.T) {
 	if !strings.Contains(c.last("b1").Detail, "Importing") {
 		t.Errorf("progress detail %q", c.last("b1").Detail)
 	}
-	// A disconnect from core tears the session down without a status (the
-	// socket is gone; core already failed it).
+	// A disconnect from core that is not followed by a rejoin within the
+	// resume grace tears the session down without a status.
 	h.OnDisconnected(fmt.Errorf("test drop"))
 	eventually(t, "session slot freed", func() bool { return h.Current() == nil })
 	if c.last("b1").State != protocol.StateBuilding {

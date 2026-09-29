@@ -30,6 +30,20 @@
 // spectator. play_slots is a FULL snapshot; JSON carries src and the peer map
 // keys as strings. An old core sends none of these and no peer_id, and the
 // host keeps v1: one implicit peer whose src 0 is slot 0.
+//
+// Resume (task 01a0dbd6 stage 6). A session outlives a dropped suite
+// socket: media is browser <-> host and never passes through core, so the
+// viewers keep watching while the socket reconnects. After the rejoin the
+// host sends ONE
+//
+//	host -> core  play_session_status + resume: true, peers: [peer_id]
+//
+// with its current state and the peers it still holds. Core keeps the
+// session for its grace window after the channel drops; the resume status
+// cancels that, and core re-sends play_peer_open for each peer it holds that
+// the host does not, play_peer_close for each the host holds that it does
+// not, and a fresh play_slots. An old core ignores the two keys and has
+// already failed the session, so the host's grace just runs out.
 package protocol
 
 import (
@@ -270,6 +284,23 @@ type Status struct {
 	State     string `json:"state"`
 	Detail    string `json:"detail"`
 	ElapsedMs int64  `json:"elapsed_ms"`
+}
+
+// ResumeStatus is the one status a host sends after the suite socket
+// rejoins while a session is running (see "Resume"). Peers is never null on
+// the wire: an empty list means the host holds no peer.
+type ResumeStatus struct {
+	Status
+	Resume bool     `json:"resume"`
+	Peers  []string `json:"peers"`
+}
+
+// NewResumeStatus builds a ResumeStatus; peers nil becomes [].
+func NewResumeStatus(st Status, peers []string) ResumeStatus {
+	if peers == nil {
+		peers = []string{}
+	}
+	return ResumeStatus{Status: st, Resume: true, Peers: peers}
 }
 
 // NewStatus builds a status, truncating detail to core's cap on a rune
