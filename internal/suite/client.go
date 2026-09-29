@@ -67,7 +67,7 @@ type Config struct {
 	Product    string // client_info.product; core stores unknown products as "unknown"
 	Version    string
 	Build      string
-	Heartbeat  time.Duration // default 30s
+	Heartbeat  time.Duration // default 10s
 	BackoffMin time.Duration // default 1s
 	BackoffMax time.Duration // default 30s
 	Logf       func(format string, args ...any)
@@ -112,7 +112,10 @@ type writeStats struct {
 // New builds a client. Run starts it.
 func New(cfg Config, h Handler) *Client {
 	if cfg.Heartbeat == 0 {
-		cfg.Heartbeat = 30 * time.Second
+		// Stage 6 (01a0dbd6): 10 s, not 30 s. A socket that stops carrying
+		// the host's frames is found in 10-20 s instead of 30-60 s (the review
+		// measured a 51 s stall), and the session resumes on a new socket.
+		cfg.Heartbeat = 10 * time.Second
 	}
 	if cfg.BackoffMin == 0 {
 		cfg.BackoffMin = time.Second
@@ -388,14 +391,19 @@ func (c *Client) session(ctx context.Context) error {
 	c.cfg.Logf("suite: joined %s as %s", c.Topic(), c.cfg.Product)
 	c.h.OnConnected()
 
-	// Heartbeat: a reply must arrive within one heartbeat interval of the
-	// beat being WRITTEN. Stage 6 (01a0dbd6): the check used to be "a reply
-	// before the next tick", and a beat whose write waited behind other
-	// writes for longer than an interval was declared missed on the ticker's
-	// buffered tick, microseconds after it went out, closing a healthy socket.
+	// Heartbeat: a reply must arrive by the next tick, unless the beat was
+	// WRITTEN less than half an interval before that tick. Stage 6
+	// (01a0dbd6): the check used to be "a reply before the next tick" alone,
+	// and a beat whose write waited behind other writes for longer than an
+	// interval was declared missed on the ticker's buffered tick,
+	// microseconds after it went out, closing a healthy socket.
+	// A reply can also beat the goroutine that wrote the beat back to hbMu
+	// (loopback, or that goroutine descheduled after the write): `early`
+	// holds the last reply ref that matched no pending beat, so the beat is
+	// not then recorded as pending forever (the same stage-6 review).
 	hbErr := make(chan error, 1)
 	var hbMu sync.Mutex
-	pending := ""
+	pending, early := "", ""
 	var sentAt time.Time
 	go func() {
 		t := time.NewTicker(c.cfg.Heartbeat)
@@ -408,8 +416,8 @@ func (c *Client) session(ctx context.Context) error {
 				hbMu.Lock()
 				waiting, age := pending != "", time.Since(sentAt)
 				hbMu.Unlock()
-				if waiting && age < c.cfg.Heartbeat {
-					continue // the beat in flight is not yet an interval old
+				if waiting && age < c.cfg.Heartbeat/2 {
+					continue // the beat in flight went out late, just now: give it a tick
 				}
 				if waiting {
 					hbErr <- fmt.Errorf("heartbeat reply missed (%s after the beat)", age.Round(time.Millisecond))
@@ -423,7 +431,9 @@ func (c *Client) session(ctx context.Context) error {
 					return
 				}
 				hbMu.Lock()
-				pending, sentAt = ref, time.Now()
+				if early != ref {
+					pending, sentAt = ref, time.Now()
+				}
 				hbMu.Unlock()
 			}
 		}
@@ -445,8 +455,12 @@ func (c *Client) session(ctx context.Context) error {
 		switch {
 		case f.Topic == "phoenix" && f.Event == "phx_reply":
 			hbMu.Lock()
-			if f.Ref != nil && *f.Ref == pending {
+			switch {
+			case f.Ref == nil:
+			case *f.Ref == pending:
 				pending = ""
+			default:
+				early = *f.Ref
 			}
 			hbMu.Unlock()
 		case f.Topic != c.Topic():

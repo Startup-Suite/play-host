@@ -308,3 +308,28 @@ func TestJitterBounds(t *testing.T) {
 		}
 	}
 }
+
+// Stage 6 (01a0dbd6): a heartbeat whose WRITE waited behind other writes for
+// longer than an interval used to be declared missed on the ticker's
+// buffered tick, microseconds after it went out, closing a healthy socket.
+// The write lock is held here for 1.6 intervals (standing in for a long
+// write; under the 3-interval read deadline), and core answers every beat:
+// the socket must stay up.
+func TestALateHeartbeatWriteIsNotAMissedReply(t *testing.T) {
+	fc, rec, c, _ := setup(t, 50*time.Millisecond, true)
+	wait(t, rec.connected, "join")
+	time.Sleep(120 * time.Millisecond) // a couple of answered beats first
+	c.mu.Lock()
+	time.Sleep(80 * time.Millisecond)
+	c.mu.Unlock()
+	select {
+	case err := <-rec.dropped:
+		t.Fatalf("a healthy socket was dropped after a late heartbeat write: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.beats < 3 {
+		t.Fatalf("only %d beats", fc.beats)
+	}
+}
