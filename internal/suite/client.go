@@ -15,7 +15,7 @@
 // Every write goes through Client.write, under one mutex: gorilla allows one
 // concurrent writer, and nothing else writes to the conn (no WriteControl,
 // no ping handler that writes). The Dialer's write buffer is 64 KiB, so a
-// signalling frame is one websocket frame, never a fragmented message.
+// signalling frame is one websocket frame (legal either way).
 //
 // The token is read from a FILE on every connect (so a rotated token is
 // picked up without a restart) and is never logged: it travels only in the
@@ -82,7 +82,12 @@ type Config struct {
 }
 
 // DefaultWriteBufferSize makes every signalling frame the host sends (core
-// caps play_signal data at 64 KiB) go out as a single websocket frame.
+// caps play_signal data at 64 KiB) go out as a single websocket frame. It
+// is tidiness, NOT the fix for task 01a0dbd6 stage 6's broken sockets:
+// fragmented messages are legal and Bandit reassembled all 150 captured on
+// one socket. Those breaks were bytes corrupted between moon's NIC and the
+// dev core container, by podman's rootlessport; the 64 KiB buffer does not
+// prevent that (docs/multiplayer-01a0dbd6.md, "Stage 6").
 const DefaultWriteBufferSize = 64 << 10
 
 // Client is one logical connection that reconnects forever until ctx ends.

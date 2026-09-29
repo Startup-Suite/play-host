@@ -237,6 +237,34 @@ while the decoder runs at 60. That readout is the hook's `fps`, and it is rVFC-b
 5. **The probe cadence is phase-locked to the frame clock.** The hook probes every 1000 ms, which is 60 frames, and reads latency at the 16.7 ms compositor frame. So within a run every sample lands in the same bucket, and the footer's p50 and `slot_stats` for one session can differ by a whole frame (16.7 ms) from the next session's for no physical reason. Seen in the appendix. Jittering the probe tick in the hook by U[0, 1 frame) would make the readout represent the phase distribution. That is a core change, not made here.
 6. **The footer's fps under-reports in headless Chrome.** It counts rVFC-presented frames, 40-55/s, while 60 are decoded. On a real display it should track decode. It explains Dalton's item 1.
 
+## Stage 6: the runtime socket breaks were the dev rig's port forwarder
+
+The task-level review saw the host's runtime socket break twice in about 35 minutes of relay runs. The first was Bandit's `Received unexpected binary frame (RFC6455§5.4)`, close 1002. The second was a stall: an offer the host logged never reached core, and the host's heartbeat timed out 51 s later. Each break ended the session for every viewer. The hypothesis was a second writer interleaving a frame between the fragments of a >4096-byte offer. **That hypothesis is wrong.**
+
+**The mechanism, measured.** podman's `rootlessport`, which publishes the moon dev core on `192.168.1.200:4033` (podman 5.6.2, rootlesskit 3.0.0, kernel 6.16.8-200.fc42), sometimes hands the container different bytes from the ones the host sent, when traffic flows in both directions. Between the two capture points are the LAN (covered by TCP checksums), the moon NIC and kernel, and rootlessport; the control below shares every hop except rootlessport and was clean. Evidence (raw outputs in `multiplayer-01a0dbd6-results/stage6/`):
+
+- **Both ends captured.** pktmon ran at wave's NIC, filtered to TCP 4033. tcpdump ran in the dev core's network namespace (`--network container:`). For the same connections, the stream wave sent parses clean under a strict RFC 6455 reassembler (`wsframes-01a0dbd6.py`, Bandit's rules plus UTF-8/JSON validation of every unmasked message). The stream the container received has one frame whose payload goes wrong part-way: offsets 2069-2778 into a 6.8-16 KB frame, with bytes masked under a different key. The next "header" is then garbage: RSV bits, opcode 13, a "binary frame", or a length that stalls the reader. `streamdiff-01a0dbd6.py` on one case: identical total length; a 13,887-byte region differs; every later frame sits at the same offset on both sides.
+- **The same on the play host's own socket.** In the 60-min run with the new host, the 04:57:24 and 05:13:53 offers arrived corrupted in the container and intact at wave's NIC. Each was followed by a heartbeat miss (stall), then a resume.
+- **Without any websocket code.** `spike/tcpcheck` sends a PRNG stream in writes of 1-16 KB from wave, and a sink verifies every byte.
+  - One-way traffic, 1.2 GB through rootlessport and 1.2 GB straight to the moon host netns: both clean, and still clean with a slow reader.
+  - With 200 B replies every 5 ms flowing back: 2 of 4 connections through rootlessport were corrupted in seconds (at bytes 11,273,679 and 28,023,954). The same traffic straight to the host netns: 0 of 4.
+  - Later bidirectional batches: 1 of 16 connections corrupted, then 0 of 48. It is intermittent.
+- **Fragmentation is not the trigger.** On the old binary (gorilla's 4096-byte buffer), 150 of the host's 295 messages in 25 min of relay runs were fragmented offers, and all were intact. The stress bursts broke at 16 KB single frames as well (7 drops in 8 min; none in the 4 min at 4096, but the checker's size comparison, 0 of 24 connections against 0 of 24, shows no size effect).
+- **Not a concurrent writer.** Every write goes through `Client.write` under one mutex. Removing that lock makes gorilla PANIC ("concurrent write to websocket connection") under `TestConcurrentFragmentedPushesNeverInterleave`, rather than emit an interleaved frame. The host process never crashed in the review.
+
+**What changed in play-host.** None of it depends on the forwarder being fixed. A real network can drop a socket too.
+
+- A dropped suite socket keeps the session for 30 s (`host.Config.ResumeGrace`). The viewers' media never passes through core, so their video does not stop. On the rejoin the host sends one `play_session_status {resume: true, peers}` and re-offers every peer that is not connected: an offer or answer lost with the socket is replaced. Core (task branch, `Platform.GameStream.Session`, "A host that drops") waits 20 s, then re-sends `play_peer_open` / `play_peer_close` / `play_slots` for what the host missed. A resume core cannot place is answered with `play_session_stop`.
+- The heartbeat miss check keys on when the beat was written. The old "reply before the next tick" rule killed a healthy socket when a beat's write waited behind other writes for longer than an interval. A reply that beats its pending mark is no longer lost. The default interval is 10 s, not 30 s, so a stalled socket is found in 10-20 s.
+- The Dialer's write buffer is 64 KiB, so a signalling frame is one websocket frame. This is tidiness only; it does not prevent the corruption.
+
+**Live, relay, new host (ce949a9).**
+
+- Deliberate blip: core's RuntimeSocket was killed while three viewers were live. The host rejoined in 0.7 s and resumed with 3 peers, re-offering 0. All three stayed live on the same pc (max frame gap 251 ms), and a reload afterwards went live in 1.26 s.
+- 60-min run: 3 real stalls from the forwarder, each resumed in about 1 s with the stuck joiner re-offered. All 53 case-4 runs passed until the harness session idled out at its 30-min idle timeout (no input in the repro, panel and reload steps; not a fault).
+
+**Remaining gap, stated.** The corruption itself is still there on this rig. A stall is found by the heartbeat (10-20 s). In that window a joiner waits, and the host's frames are lost until the reconnect. Removing the cause is infra work, outside this task: publish the dev core without rootlessport (host network or pasta port forwarding), or fix or upgrade rootlessport. The milvenan prod core on moon is published the same way (`0.0.0.0:4000`); whether real clients reach it through rootlessport is for the infra owner to check.
+
 ## Appendix: the phase-locked first series (no jitter)
 
 These runs are valid in every other respect: prod was idle, moon was quiet, n ≥ 50 and the rows match. But their samples fall in one or two 16.7 ms buckets per slot, so they are shown only to document Finding 5.
