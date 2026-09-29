@@ -10,7 +10,7 @@
 //          --players 2 --spectators 0 --n 50 --label p2-lan \
 //          --out results/p2-lan-01a0dbd6.json [--shot results/p2-lan.jpg] \
 //          [--users jordan,ryan,saru,octavia,brosnan,higgins] [--mobile 1]
-//          [--jitter-ms 34]
+//          [--jitter-ms 34] [--forge-spectator]
 //
 // Node 22+, no npm deps. Needs a dev core with /dev/login?as=<name> and a
 // running multi session behind the canvas. Every browser context is closed
@@ -37,6 +37,10 @@ const n = +arg('n', 50), keyEvery = +arg('key-every', 10000), label = arg('label
 const out = arg('out'), shotOut = arg('shot'), maxS = +arg('max-seconds', 240);
 const users = arg('users', 'jordan,ryan,saru,octavia,brosnan,higgins,mycroft,geordi').split(',');
 const jitterMs = +arg('jitter-ms', 0);
+// --forge-spectator: AFTER a spectator's honest send count is read, it sends
+// ONE forged key on the host's input-events channel, as a positive control
+// for the host's per-peer dropped-input counter (the host must drop it).
+const forgeSpectator = process.argv.includes('--forge-spectator');
 const mobile = new Set((arg('mobile', '') || '').split(',').filter(Boolean).map(Number));
 if (!canvas) throw new Error('--canvas is required');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -82,10 +86,48 @@ const INSTRUMENT = `(() => {
     const at = performance.now()
     if (s5.pcAt == null) s5.pcAt = at
     s5.pcs.push({ pc, at })
+    s5.channels = s5.channels || []
+    pc.addEventListener('datachannel', e => s5.channels.push(e.channel))
     return pc
   }
   window.RTCPeerConnection.prototype = PC.prototype
   Object.setPrototypeOf(window.RTCPeerConnection, PC)
+  // Every LiveView frame that carries a game_stream push, as it arrives on
+  // the socket (before any hook sees it): time, phoenix event, and whether
+  // it holds an offer / status. No SDP is kept.
+  s5.ws = []
+  const WS = window.WebSocket
+  window.WebSocket = function (...a) {
+    const ws = new WS(...a)
+    ws.addEventListener('message', e => {
+      if (typeof e.data !== 'string' || !e.data.includes('game_stream')) return
+      let ev = null
+      try { ev = JSON.parse(e.data)[3] } catch (_) {}
+      s5.ws.push({ at: performance.now(), ev, offer: e.data.includes('"kind":"offer"'), status: (e.data.match(/"state":"([a-z]+)"/) || [])[1] || null, peer: (e.data.match(/"peer_id":"([0-9a-f-]{36})"/) || [])[1] || null })
+    })
+    return ws
+  }
+  window.WebSocket.prototype = WS.prototype
+  Object.setPrototypeOf(window.WebSocket, WS)
+  // Wrap the hook's onServer as soon as the hook exists (polled every 5 ms).
+  s5.server = []
+  const early = setInterval(() => {
+    if (!window.liveSocket) return
+    for (const el of document.querySelectorAll('[phx-hook=GameStream]')) {
+      let view = null
+      liveSocket.owner(el, v => (view = v))
+      const hook = view && el.phxPrivate && view.viewHooks[el.phxPrivate.hookId]
+      if (!hook || hook.__s5early) continue
+      hook.__s5early = true
+      const on = hook.onServer.bind(hook)
+      hook.onServer = msg => {
+        s5.server.push({ at: performance.now(), type: msg && msg.type, kind: msg && msg.kind, state: msg && msg.status && msg.status.state, active: hook.active(), mine: !!msg && msg.session_id === hook.sessionId, peerId: hook.peerId || null, panel: hook.panel })
+        return on(msg)
+      }
+      s5.hookedAt = performance.now()
+    }
+  }, 5)
+  setTimeout(() => clearInterval(early), 60000)
   const arm = setInterval(() => {
     const v = document.querySelector('[phx-hook=GameStream] video')
     if (!v || typeof v.requestVideoFrameCallback !== 'function') return
@@ -144,6 +186,19 @@ const STATE = `(() => {
     fps: h ? h.fps : null,
     path: h ? h.path : null,
     pcState: h && h.pc ? h.pc.connectionState : null,
+  }
+})()`;
+
+// What a viewer that never went live was doing.
+const DIAG = `(() => {
+  const hooks = window.__s5hooks || []
+  const h = hooks[0]
+  return {
+    now: performance.now(), pcAt: window.__s5.pcAt,
+    pcs: window.__s5.pcs.map(p => ({ at: p.at, sig: p.pc.signalingState, ice: p.pc.iceConnectionState, conn: p.pc.connectionState, gather: p.pc.iceGatheringState })),
+    hook: h ? { sessionId: h.sessionId, peerId: h.peerId, panel: h.panel, serverState: h.serverState, pcId: h.pcId, active: h.active(), suspended: h.suspended, dead: h.dead, multi: h.multi } : null,
+    hookedAt: window.__s5.hookedAt, server: window.__s5.server, ws: window.__s5.ws,
+    sends: window.__s5.sends.length,
   }
 })()`;
 
@@ -211,6 +266,8 @@ async function waitFor(v, pred, what, ms = 30000) {
     if (st && pred(st)) return st;
     await sleep(250);
   }
+  const diag = await v.ev(DIAG).catch(e => ({ err: String(e) }));
+  console.error(`viewer ${v.i} (${v.user}) DIAG`, JSON.stringify(diag));
   throw new Error(`viewer ${v.i} (${v.user}): timeout waiting for ${what}: ${JSON.stringify(st)}`);
 }
 
@@ -311,6 +368,20 @@ try {
       sends_total: raw.sends.length, sends_by_type: byType,
       samples: raw.samples, fps_series: v.fps,
     });
+  }
+  if (forgeSpectator) {
+    result.forged = [];
+    for (const v of viewers.filter(v => v.role === 'spectator')) {
+      const r = await v.ev(`(() => {
+        const ch = (window.__s5.channels || []).filter(c => c.label === 'input-events' && c.readyState === 'open').pop()
+        if (!ch) return { sent: false, channels: (window.__s5.channels || []).map(c => c.label + ':' + c.readyState) }
+        ch.send(JSON.stringify({ t: 'key', code: 'KeyD', down: true, slot: 0 }))
+        ch.send(JSON.stringify({ t: 'key', code: 'KeyD', down: false, slot: 0 }))
+        return { sent: true, at: new Date().toISOString() }
+      })()`);
+      result.forged.push({ user: v.user, ...r });
+    }
+    await sleep(11000); // the host logs drops at most once per 10 s per peer
   }
   result.ended_at = new Date().toISOString();
   if (out) fs.writeFileSync(out, JSON.stringify(result, null, 1));
