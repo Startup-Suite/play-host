@@ -252,6 +252,25 @@ The task-level review saw the host's runtime socket break twice in about 35 minu
 - **Fragmentation is not the trigger.** On the old binary (gorilla's 4096-byte buffer), 150 of the host's 295 messages in 25 min of relay runs were fragmented offers, and all were intact. The stress bursts broke at 16 KB single frames as well (7 drops in 8 min; none in the 4 min at 4096, but the checker's size comparison, 0 of 24 connections against 0 of 24, shows no size effect).
 - **Not a concurrent writer.** Every write goes through `Client.write` under one mutex. Removing that lock makes gorilla PANIC ("concurrent write to websocket connection") under `TestConcurrentFragmentedPushesNeverInterleave`, rather than emit an interleaved frame. The host process never crashed in the review.
 
+**Re-run the raw-TCP reproduction** (`spike/tcpcheck`; ports 47101/47102 are free on moon and far from the prod play-host's 40300-40330):
+
+```
+# build (any box; Go 1.25)
+CGO_ENABLED=0 go build -o tcpcheck ./spike/tcpcheck
+GOOS=windows go build -o tcpcheck.exe ./spike/tcpcheck
+# moon: one sink behind rootlessport (a rootless bridge container), one on the host netns
+podman run -d --name tcpcheck-rlp --network dev -p 192.168.1.200:47101:9000 -v $PWD:/w:z \
+  docker.io/library/alpine:latest /w/tcpcheck serve -addr :9000 -slow 1ms -read 8192 -reply 5ms -reply-bytes 200
+./tcpcheck serve -addr 192.168.1.200:47102 -slow 1ms -read 8192 -reply 5ms -reply-bytes 200 &
+# wave (or any LAN client): 4 connections x 40 MB each way, writes of 1-16 KB
+tcpcheck.exe send -addr 192.168.1.200:47101 -bytes 40000000 -conns 4 -min 1000 -max 16000 -pause 1ms
+tcpcheck.exe send -addr 192.168.1.200:47102 -bytes 40000000 -conns 4 -min 1000 -max 16000 -pause 1ms
+# a corrupted connection logs, on the sink:  MISMATCH conn ... at byte N ... got .. want ..
+# and on the sender:                         conn K seed S: server says MISMATCH N
+```
+
+Drop `-reply` to see the one-way control (clean). The corruption is intermittent: repeat the send a few times.
+
 **What changed in play-host.** None of it depends on the forwarder being fixed. A real network can drop a socket too.
 
 - A dropped suite socket keeps the session for 30 s (`host.Config.ResumeGrace`). The viewers' media never passes through core, so their video does not stop. On the rejoin the host sends one `play_session_status {resume: true, peers}` and re-offers every peer that is not connected: an offer or answer lost with the socket is replaced. Core (task branch, `Platform.GameStream.Session`, "A host that drops") waits 20 s, then re-sends `play_peer_open` / `play_peer_close` / `play_slots` for what the host missed. A resume core cannot place is answered with `play_session_stop`.
