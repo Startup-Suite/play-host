@@ -284,6 +284,21 @@ Drop `-reply` to see the one-way control (clean). The corruption is intermittent
 
 **Remaining gap, stated.** The corruption itself is still there on this rig. A stall is found by the heartbeat (10-20 s). In that window a joiner waits, and the host's frames are lost until the reconnect. Removing the cause is infra work, outside this task: publish the dev core without rootlessport (host network or pasta port forwarding), or fix or upgrade rootlessport. The milvenan prod core on moon is published the same way (`0.0.0.0:4000`); whether real clients reach it through rootlessport is for the infra owner to check.
 
+### Correction (2026-09-29, after merge): rootlessport is not the sole cause
+
+An independent reproduction refuted the attribution above. The heading and "The mechanism, measured" name rootlessport as the cause. Read them as **a byte-corruption fault on the wave to moon path, cause under investigation.** The resume-on-reconnect work under "What changed in play-host" stands either way.
+
+- **The host-netns path also corrupts.** A moon container on `--network host`, which never goes through rootlessport, corrupted 2 of 300 connections from wave. The signature is the same: a region is replaced by the connection's own bytes from 97-1,355 bytes earlier, and the total length is unchanged.
+- **rootlessport raises the rate but is not the sole cause.** Through rootlessport, 24 of 548 connections from wave were corrupted. Through pasta, 0 of 200 were.
+- **Only wave triggered it.** Clients on hive and on moon itself had 0 corrupted connections on every path, rootlessport included (about 21 GB of client-to-server data).
+- **wave to hive was clean:** 0 of 201. That run was interleaved with a rootlessport run from wave that corrupted 13 of 200.
+- **Version fix.** podman's rootlessport bundles rootlesskit v2.3.5, not the 3.0.0 stated above.
+- **The stage-6 control could not tell the two causes apart.** A 0 of 4 result on the host netns cannot distinguish them at a rate of about 1-4%.
+- **Current hypothesis, NOT measured:** the wave and moon pair. Both have RTL8125 NICs, and wave has large send offload and checksum offload on. The missing measurement is a capture on moon's `enp6s0` during a wave run.
+- **Raw data:** hive `~/sources/tmp/tcpcheck-rlp/RESULTS-652388.txt`.
+
+The "Remaining gap" remedy (publish the dev core without rootlessport) should therefore lower the rate, but it is not expected to remove the fault.
+
 ## Appendix: the phase-locked first series (no jitter)
 
 These runs are valid in every other respect: prod was idle, moon was quiet, n ≥ 50 and the rows match. But their samples fall in one or two 16.7 ms buckets per slot, so they are shown only to document Finding 5.
