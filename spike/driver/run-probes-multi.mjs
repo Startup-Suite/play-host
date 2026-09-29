@@ -10,6 +10,7 @@
 //          --players 2 --spectators 0 --n 50 --label p2-lan \
 //          --out results/p2-lan-01a0dbd6.json [--shot results/p2-lan.jpg] \
 //          [--users jordan,ryan,saru,octavia,brosnan,higgins] [--mobile 1]
+//          [--jitter-ms 34]
 //
 // Node 22+, no npm deps. Needs a dev core with /dev/login?as=<name> and a
 // running multi session behind the canvas. Every browser context is closed
@@ -35,6 +36,7 @@ const canvas = arg('canvas'), players = +arg('players', 1), spectators = +arg('s
 const n = +arg('n', 50), keyEvery = +arg('key-every', 10000), label = arg('label', 'run');
 const out = arg('out'), shotOut = arg('shot'), maxS = +arg('max-seconds', 240);
 const users = arg('users', 'jordan,ryan,saru,octavia,brosnan,higgins,mycroft,geordi').split(',');
+const jitterMs = +arg('jitter-ms', 0);
 const mobile = new Set((arg('mobile', '') || '').split(',').filter(Boolean).map(Number));
 if (!canvas) throw new Error('--canvas is required');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -45,7 +47,27 @@ const log = (...a) => console.error(`[${((Date.now() - t0) / 1000).toFixed(1)}s]
 // RTCPeerConnection (with its construction time) and the first presented
 // video frame.
 const INSTRUMENT = `(() => {
-  window.__s5 = { sends: [], pcs: [], firstFrameAt: null, pcAt: null }
+  window.__s5 = { sends: [], pcs: [], firstFrameAt: null, pcAt: null, jitterMs: ${jitterMs} }
+  // --jitter-ms J: every 1000 ms setInterval (the hook's tick, which sends
+  // one probe per tick) instead fires after 1000 + U[0, J) ms. The hook's
+  // tick is otherwise phase-locked to a 60 Hz frame clock (1000 ms is 60
+  // frames), so every probe of a run lands at the same frame phase and the
+  // run samples one 16.7 ms bucket instead of the phase distribution.
+  if (${jitterMs} > 0) {
+    const si = window.setInterval.bind(window), ci = window.clearInterval.bind(window)
+    const live = new Map(); let next = 1e9
+    window.setInterval = function (fn, ms, ...rest) {
+      if (ms !== 1000 || typeof fn !== 'function') return si(fn, ms, ...rest)
+      const id = next++
+      const arm = () => live.set(id, setTimeout(() => { if (!live.has(id)) return; try { fn(...rest) } finally { if (live.has(id)) arm() } }, 1000 + Math.random() * ${jitterMs}))
+      arm()
+      return id
+    }
+    window.clearInterval = function (id) {
+      if (live.has(id)) { clearTimeout(live.get(id)); live.delete(id); return }
+      return ci(id)
+    }
+  }
   const s5 = window.__s5
   const send = RTCDataChannel.prototype.send
   RTCDataChannel.prototype.send = function (data) {
@@ -195,7 +217,7 @@ async function waitFor(v, pred, what, ms = 30000) {
 const pct = (a, p) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[Math.max(0, Math.ceil(p * s.length) - 1)]; };
 const r1 = x => (x == null ? null : Math.round(x * 10) / 10);
 
-const result = { label, canvas, app, players, spectators, n_target: n, started_at: new Date().toISOString(), viewers: [], phases: {} };
+const result = { label, canvas, app, players, spectators, n_target: n, jitter_ms: jitterMs, started_at: new Date().toISOString(), viewers: [], phases: {} };
 const viewers = [];
 try {
   // Open every viewer, one after another, so each later one is a joiner
