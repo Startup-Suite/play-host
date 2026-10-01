@@ -47,6 +47,9 @@ func TestPatchProjectGodotVoltron(t *testing.T) {
 	if !strings.Contains(out, "enabled=PackedStringArray()") {
 		t.Fatalf("editor plugin list:\n%s", out)
 	}
+	if strings.Count(out, AudioMixRate) != 1 {
+		t.Fatalf("48 kHz audio mix rate not pinned once:\n%s", out)
+	}
 	for _, keep := range []string{`run/main_scene="res://main/main.tscn"`, `3d/physics_engine="Jolt Physics"`, "config_version=5"} {
 		if !strings.Contains(out, keep) {
 			t.Errorf("lost %q", keep)
@@ -62,13 +65,28 @@ func TestPatchProjectGodotVoltron(t *testing.T) {
 	}
 }
 
+func TestPatchProjectGodotReplacesDeviceMixRate(t *testing.T) {
+	src := "config_version=5\n\n[audio]\n\ndriver/mix_rate=96000\ndriver/enable_input=false\n"
+	out, _ := PatchProjectGodot(src)
+	if strings.Contains(out, "mix_rate=96000") || strings.Count(out, AudioMixRate) != 1 {
+		t.Fatalf("audio rate not replaced exactly once:\n%s", out)
+	}
+	if !strings.Contains(out, "driver/enable_input=false") {
+		t.Fatalf("other audio setting lost:\n%s", out)
+	}
+	again, _ := PatchProjectGodot(out)
+	if again != out {
+		t.Fatalf("audio patch not idempotent:\n%s\n---\n%s", out, again)
+	}
+}
+
 func TestPatchProjectGodotKeepsOtherPluginsAndAddsSection(t *testing.T) {
 	src := "config_version=5\r\n\r\n[editor_plugins]\r\n\r\nenabled=PackedStringArray(\"res://addons/other/plugin.cfg\", \"res://addons/godot_ai/plugin.cfg\")\r\n"
 	out, removed := PatchProjectGodot(src)
 	if !strings.Contains(out, `enabled=PackedStringArray("res://addons/other/plugin.cfg")`) || len(removed) != 1 {
 		t.Fatalf("out %s removed %v", out, removed)
 	}
-	if !strings.HasSuffix(out, "[autoload]\n\n"+Autoload+"\n") {
+	if !strings.Contains(out, "[autoload]\n\n"+Autoload+"\n") {
 		t.Fatalf("no autoload section appended:\n%q", out)
 	}
 }
