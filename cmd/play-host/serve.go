@@ -40,6 +40,7 @@ type FileConfig struct {
 	UDPMax          uint16       `json:"udp_max"`
 	GodotPort       int          `json:"godot_port"`
 	RTPPort         int          `json:"rtp_port"`
+	AudioRTPPort    int          `json:"audio_rtp_port"`
 	ImportTimeoutS  int          `json:"import_timeout_s"`
 	KeepCheckouts   int          `json:"keep_checkouts"`
 	Repos           []build.Repo `json:"repos"`
@@ -67,6 +68,9 @@ func LoadConfig(path string) (FileConfig, error) {
 	if c.RTPPort == 0 {
 		c.RTPPort = 40330
 	}
+	if c.AudioRTPPort == 0 {
+		c.AudioRTPPort = c.RTPPort + 1
+	}
 	for name, v := range map[string]string{"suite_url": c.SuiteURL, "runtime_id": c.RuntimeID, "token_file": c.TokenFile,
 		"godot": c.Godot, "ffmpeg": c.FFmpeg, "git": c.Git, "mirrors_dir": c.MirrorsDir, "checkouts_dir": c.CheckoutsDir,
 		"addon_dir": c.AddonDir, "logs_dir": c.LogsDir} {
@@ -83,7 +87,7 @@ func LoadConfig(path string) (FileConfig, error) {
 func (c FileConfig) hostConfig() host.Config {
 	return host.Config{
 		Godot: c.Godot, FFmpeg: c.FFmpeg, LogsDir: c.LogsDir, HostIP: c.HostIP, UDPMin: c.UDPMin, UDPMax: c.UDPMax,
-		GodotPort: c.GodotPort, RTPPort: c.RTPPort,
+		GodotPort: c.GodotPort, RTPPort: c.RTPPort, AudioRTPPort: c.AudioRTPPort,
 		ImportTimeout: time.Duration(c.ImportTimeoutS) * time.Second,
 		LinkTimeout:   time.Duration(c.LaunchTimeoutS) * time.Second,
 		ProgressEvery: time.Duration(c.ProgressEveryMs) * time.Millisecond,

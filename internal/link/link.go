@@ -1,7 +1,6 @@
 // Package link is the 127.0.0.1 TCP connection between the play host and the
 // suite_play addon inside Godot. Host -> game is newline-delimited JSON (see
-// internal/input for the message set); game -> host is "SPF1" frame records
-// (frames.go), sent only while the host has asked for export.
+// internal/input); game -> host multiplexes SPF1 video and SPA1 game PCM.
 package link
 
 import (
@@ -19,6 +18,15 @@ type Link struct {
 	conn net.Conn
 	r    *bufio.Reader
 	wmu  sync.Mutex
+}
+
+// Record is one multiplexed game -> host media record. Exactly one header is
+// populated. Payload is valid until the next ReadRecord call reuses its
+// buffer; consumers that queue it must copy it first.
+type Record struct {
+	Frame *FrameHeader
+	PCM   *PCMHeader
+	Data  []byte
 }
 
 // Dial connects to the addon, retrying until deadline (Godot takes a few
@@ -61,7 +69,7 @@ func (l *Link) Send(v any) error {
 	return err
 }
 
-// ReadFrame reads one frame record into buf (grown as needed).
+// ReadFrame reads one legacy video-only record into buf (grown as needed).
 func (l *Link) ReadFrame(buf []byte) (FrameHeader, []byte, error) {
 	h, err := ReadFrameHeader(l.r)
 	if err != nil {
@@ -75,6 +83,41 @@ func (l *Link) ReadFrame(buf []byte) (FrameHeader, []byte, error) {
 		return h, buf, err
 	}
 	return h, buf, nil
+}
+
+// ReadRecord reads one SPF1 video or SPA1 PCM record from the shared stream.
+func (l *Link) ReadRecord(buf []byte) (Record, []byte, error) {
+	magic, err := l.r.Peek(4)
+	if err != nil {
+		return Record{}, buf, err
+	}
+	var length uint32
+	rec := Record{}
+	switch [4]byte(magic) {
+	case frameMagic:
+		h, err := ReadFrameHeader(l.r)
+		if err != nil {
+			return Record{}, buf, err
+		}
+		rec.Frame, length = &h, h.Length
+	case pcmMagic:
+		h, err := ReadPCMHeader(l.r)
+		if err != nil {
+			return Record{}, buf, err
+		}
+		rec.PCM, length = &h, h.Length
+	default:
+		return Record{}, buf, fmt.Errorf("bad record magic %q", magic)
+	}
+	if cap(buf) < int(length) {
+		buf = make([]byte, length)
+	}
+	buf = buf[:length]
+	if _, err := io.ReadFull(l.r, buf); err != nil {
+		return Record{}, buf, err
+	}
+	rec.Data = buf
+	return rec, buf, nil
 }
 
 // Close closes the connection.
