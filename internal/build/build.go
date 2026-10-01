@@ -421,11 +421,6 @@ func copyTree(src, dst string) error {
 // Autoload is the line the addon is registered with.
 const Autoload = `SuitePlay="*res://addons/suite_play/suite_play.gd"`
 
-// AudioMixRate pins the throwaway play checkout to the SPA1/WebRTC rate. On
-// Windows Godot otherwise follows the output device's configured mix rate;
-// Wave's device is 96 kHz, while the transport contract is 48 kHz stereo.
-const AudioMixRate = `driver/mix_rate=48000`
-
 var pluginEntryRe = regexp.MustCompile(`"[^"]*"`)
 
 // PatchProjectGodot edits a project.godot for a played build:
@@ -438,17 +433,13 @@ var pluginEntryRe = regexp.MustCompile(`"[^"]*"`)
 //     editor, which loads enabled editor plugins, and godot_ai's editor
 //     plugin dials ws://127.0.0.1:9500 (addons/godot_ai/connection.gd:347,
 //     DEFAULT_WS_PORT in client_configurator.gd:41) — Connery's MCP backend.
-//   - [audio]: pin driver/mix_rate to 48000. This is a throwaway checkout and
-//     SPA1 is explicitly 48 kHz, so the host must not inherit a 96 kHz Windows
-//     output-device setting and silently publish an empty audio track.
 //
-// Everything else is left byte-for-byte. It returns the removed helper/plugin lines.
+// Everything else is left byte-for-byte. It returns the removed lines.
 func PatchProjectGodot(src string) (string, []string) {
 	lines := strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
 	var out, removed []string
 	section := ""
 	sawAutoload, added := false, false
-	sawAudio, audioAdded := false, false
 	flushAutoload := func() {
 		if section == "autoload" && !added {
 			// Drop the section's trailing blanks, then: header, blank, entries,
@@ -463,28 +454,13 @@ func PatchProjectGodot(src string) (string, []string) {
 			added = true
 		}
 	}
-	flushAudio := func() {
-		if section == "audio" && !audioAdded {
-			for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
-				out = out[:len(out)-1]
-			}
-			if strings.TrimSpace(out[len(out)-1]) == "[audio]" {
-				out = append(out, "")
-			}
-			out = append(out, AudioMixRate, "")
-			audioAdded = true
-		}
-	}
 	for _, l := range lines {
 		t := strings.TrimSpace(l)
 		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
 			flushAutoload()
-			flushAudio()
 			section = strings.Trim(t, "[]")
 			if section == "autoload" {
 				sawAutoload = true
-			} else if section == "audio" {
-				sawAudio = true
 			}
 			out = append(out, l)
 			continue
@@ -510,26 +486,15 @@ func PatchProjectGodot(src string) (string, []string) {
 				out = append(out, "enabled=PackedStringArray("+strings.Join(keep, ", ")+")")
 				continue
 			}
-		case "audio":
-			if strings.HasPrefix(t, "driver/mix_rate=") {
-				continue
-			}
 		}
 		out = append(out, l)
 	}
 	flushAutoload()
-	flushAudio()
 	if !sawAutoload {
 		for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
 			out = out[:len(out)-1]
 		}
 		out = append(out, "", "[autoload]", "", Autoload, "")
-	}
-	if !sawAudio {
-		for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
-			out = out[:len(out)-1]
-		}
-		out = append(out, "", "[audio]", "", AudioMixRate, "")
 	}
 	return strings.Join(out, "\n"), removed
 }

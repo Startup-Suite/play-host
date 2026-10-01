@@ -80,6 +80,13 @@ var probes_seen := 0
 var audio_chunks_sent := 0
 var audio_frames_dropped := 0
 var _capture: AudioEffectCapture
+var _audio_mix_rate := AUDIO_RATE
+# Streaming rational resampler state. Source frames are accumulated until the
+# 48 kHz output clock advances; downsampling averages each covered source
+# window, while an input rate below 48 kHz repeats the current window sample.
+var _audio_resample_clock := 0
+var _audio_resample_sum := Vector2.ZERO
+var _audio_resample_count := 0
 var _keycodes := {}  # name -> Key
 var _held_keys := {}  # "d:keycode:loc" -> [keycode, loc, d]
 var _held_buttons := {}  # "d:b" -> [d, b]
@@ -370,9 +377,9 @@ func _send_frame(w: int, h: int, kind: int, data: PackedByteArray) -> void:
 ## only PCM mixed by this Godot process. AudioEffectCapture does not record an
 ## OS input/output device and does not mute or otherwise alter the bus.
 func _setup_audio_capture() -> void:
-	var mix_rate := int(AudioServer.get_mix_rate())
-	if mix_rate != AUDIO_RATE:
-		push_error("suite_play: Master mix rate %d is unsupported; expected %d" % [mix_rate, AUDIO_RATE])
+	_audio_mix_rate = int(AudioServer.get_mix_rate())
+	if _audio_mix_rate <= 0:
+		push_error("suite_play: Master mix rate is invalid: %d" % _audio_mix_rate)
 		return
 	var master := AudioServer.get_bus_index("Master")
 	if master < 0:
@@ -381,7 +388,10 @@ func _setup_audio_capture() -> void:
 	_capture = AudioEffectCapture.new()
 	_capture.buffer_length = 0.2
 	AudioServer.add_bus_effect(master, _capture)
-	print("suite_play: capturing Master PCM %d Hz stereo f32le" % AUDIO_RATE)
+	if _audio_mix_rate == AUDIO_RATE:
+		print("suite_play: capturing Master PCM %d Hz stereo f32le" % AUDIO_RATE)
+	else:
+		print("suite_play: capturing Master PCM %d Hz -> %d Hz stereo f32le" % [_audio_mix_rate, AUDIO_RATE])
 
 
 ## Drains at most 100 ms per process tick in 20 ms records. If the game or TCP
@@ -390,20 +400,45 @@ func _drain_audio() -> void:
 	if _capture == null or _peer == null or not exporting:
 		return
 	var available := _capture.get_frames_available()
-	if available > AUDIO_MAX_BACKLOG:
-		var drop := available - AUDIO_MAX_BACKLOG
+	var max_backlog := ceili(float(AUDIO_MAX_BACKLOG * _audio_mix_rate) / AUDIO_RATE)
+	if available > max_backlog:
+		var drop := available - max_backlog
 		_capture.get_buffer(drop)
 		audio_frames_dropped += drop
-		available = AUDIO_MAX_BACKLOG
+		available = max_backlog
+	var source_chunk := ceili(float(AUDIO_CHUNK_FRAMES * _audio_mix_rate) / AUDIO_RATE)
 	var chunks := 0
 	while available > 0 and chunks < AUDIO_MAX_CHUNKS_PER_TICK:
-		var count := mini(available, AUDIO_CHUNK_FRAMES)
+		var count := mini(available, source_chunk)
 		var frames := _capture.get_buffer(count)
 		if frames.is_empty():
 			break
-		_send_audio(frames)
+		_send_audio(_resample_audio(frames))
 		available -= frames.size()
 		chunks += 1
+
+
+## Converts the device/project mix rate to SPA1's fixed 48 kHz clock without
+## resetting phase at capture-buffer boundaries. At Wave's 96 kHz this emits
+## one averaged output frame for each pair of source frames.
+func _resample_audio(frames: PackedVector2Array) -> PackedVector2Array:
+	if _audio_mix_rate == AUDIO_RATE:
+		return frames
+	var out := PackedVector2Array()
+	for frame in frames:
+		_audio_resample_sum += frame
+		_audio_resample_count += 1
+		_audio_resample_clock += AUDIO_RATE
+		var emit := _audio_resample_clock / _audio_mix_rate
+		if emit <= 0:
+			continue
+		_audio_resample_clock %= _audio_mix_rate
+		var sample := _audio_resample_sum / float(_audio_resample_count)
+		for _i in emit:
+			out.append(sample)
+		_audio_resample_sum = Vector2.ZERO
+		_audio_resample_count = 0
+	return out
 
 
 func _send_audio(frames: PackedVector2Array) -> void:
