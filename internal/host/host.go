@@ -10,8 +10,8 @@
 //
 // N peers, one encode (task 01a0dbd6). A session holds `peers`, one per
 // WebRTC connection, keyed by the core-minted peer_id (internal/protocol,
-// "Widening"). ffmpeg/NVENC encodes ONCE into one TrackLocalStaticRTP, and
-// every peer binds that same track, so VRAM is flat and only upstream grows
+// "Widening"). ffmpeg/NVENC encodes video once and libopus encodes Master-bus PCM once;
+// every peer binds both shared tracks, so VRAM is flat and only upstream grows
 // with viewers. The encoder and the addon's export run while at least one
 // peer is connected and stop at zero, so a joiner or a leaver never restarts
 // the stream for the others. All peers share one UDP port (rtc.NewMuxAPI).
@@ -52,8 +52,8 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// newPeerGather is rtc.NewPeerGather; tests swap it to make offers fail.
-var newPeerGather = rtc.NewPeerGather
+// newPeerGather is rtc.NewPeerGatherTracks; tests swap it to make offers fail.
+var newPeerGather = rtc.NewPeerGatherTracks
 
 // Config is everything the engine needs about the machine.
 type Config struct {
@@ -66,6 +66,7 @@ type Config struct {
 	UDPMax        uint16
 	GodotPort     int
 	RTPPort       int
+	AudioRTPPort  int
 	ImportTimeout time.Duration
 	LinkTimeout   time.Duration
 	ProgressEvery time.Duration // building/progress status cadence (5 s)
@@ -139,6 +140,9 @@ func New(cfg Config, send Sender, stages Stages, logf func(string, ...any)) *Hos
 	}
 	if cfg.IdleCheck == 0 {
 		cfg.IdleCheck = time.Second
+	}
+	if cfg.AudioRTPPort == 0 {
+		cfg.AudioRTPPort = cfg.RTPPort + 1
 	}
 	if cfg.LinkTimeout == 0 {
 		cfg.LinkTimeout = 90 * time.Second
@@ -381,18 +385,20 @@ type Session struct {
 	endWhy   string
 	report   bool // send the terminal status (false when the socket is gone)
 
-	lastInput atomic.Int64 // unix nanos
-	dir       string       // the checkout, removed at the end
-	godot     launch.Proc
-	link      *link.Link
-	api       *webrtc.API
-	mux       io.Closer // the one shared UDP port
-	rtcCfg    rtc.Config
-	track     *webrtc.TrackLocalStaticRTP
-	enc       *media.Pipeline
-	events    chan func()
-	liveSent  atomic.Bool
-	exporting atomic.Bool
+	lastInput  atomic.Int64 // unix nanos
+	dir        string       // the checkout, removed at the end
+	godot      launch.Proc
+	link       *link.Link
+	api        *webrtc.API
+	mux        io.Closer // the one shared UDP port
+	rtcCfg     rtc.Config
+	track      *webrtc.TrackLocalStaticRTP
+	audioTrack *webrtc.TrackLocalStaticRTP
+	enc        *media.Pipeline
+	audio      *media.AudioPipeline
+	events     chan func()
+	liveSent   atomic.Bool
+	exporting  atomic.Bool
 
 	// peers is touched ONLY on the session loop.
 	peers map[string]*peerState
@@ -717,7 +723,7 @@ func (s *Session) run() {
 		s.fail("webrtc: " + err.Error())
 		return
 	}
-	go s.guard("frames", s.readFrames)
+	go s.guard("media", s.readMedia)
 
 	s.pmu.Lock()
 	s.mediaReady = true
@@ -746,8 +752,8 @@ func (s *Session) run() {
 	}
 }
 
-// setupMedia builds the pion API (one shared UDP port), the ONE video track
-// every peer binds, and the encoder pipeline; they outlive peers.
+// setupMedia builds the pion API, shared video/audio tracks and both encoder
+// pipelines; they outlive individual peers.
 func (s *Session) setupMedia() error {
 	cfg := rtc.Config{PortMin: s.h.cfg.UDPMin, PortMax: s.h.cfg.UDPMax, ICEServers: ICEServers(s.start.ICEServers), IncludeLoopback: s.h.cfg.Loopback, LogWriter: s.h.cfg.PionLog}
 	if s.h.cfg.HostIP != "" {
@@ -763,9 +769,15 @@ func (s *Session) setupMedia() error {
 	if err != nil {
 		return err
 	}
-	s.api, s.rtcCfg, s.track = api, cfg, track
+	audioTrack, err := rtc.NewAudioTrackRTP()
+	if err != nil {
+		return err
+	}
+	s.api, s.rtcCfg, s.track, s.audioTrack = api, cfg, track, audioTrack
 	s.enc = &media.Pipeline{FFmpeg: s.h.cfg.FFmpeg, Preset: s.start.Encoder, RTPPort: s.h.cfg.RTPPort, Track: track,
 		LogPath: filepath.Join(s.h.cfg.LogsDir, "ffmpeg-"+s.ID()+".log"), Counts: &media.Counters{}}
+	s.audio = &media.AudioPipeline{FFmpeg: s.h.cfg.FFmpeg, RTPPort: s.h.cfg.AudioRTPPort, Track: audioTrack,
+		LogPath: filepath.Join(s.h.cfg.LogsDir, "ffmpeg-audio-"+s.ID()+".log"), Counts: &media.Counters{}}
 	return nil
 }
 
@@ -814,7 +826,7 @@ func (s *Session) gatherOffer(ps *peerState) {
 		var p *rtc.Peer
 		var offer string
 		var g rtc.Gather
-		p, offer, g, err = newPeerGather(s.api, s.rtcCfg, s.track, s.callbacks(ps, holder))
+		p, offer, g, err = newPeerGather(s.api, s.rtcCfg, []webrtc.TrackLocal{s.track, s.audioTrack}, s.callbacks(ps, holder))
 		if err == nil {
 			if !s.post(func() { s.installPeer(ps, holder, p, offer, g) }) {
 				p.Close() // the session ended while it gathered
@@ -958,8 +970,8 @@ func (s *Session) closePeer(ps *peerState) {
 	s.mediaCheck()
 }
 
-// mediaCheck runs the encoder and the addon's export while at least one
-// peer is connected, and stops them at zero. Loop only.
+// mediaCheck runs both encoders and the addon's export while at least one
+// peer is connected, and tears all producer state down at zero. Loop only.
 func (s *Session) mediaCheck() {
 	n := 0
 	for _, ps := range s.peers {
@@ -969,14 +981,18 @@ func (s *Session) mediaCheck() {
 	}
 	switch {
 	case n > 0 && !s.exporting.Load():
+		if err := s.audio.Start(); err != nil {
+			s.fail("audio encoder: " + err.Error())
+			return
+		}
 		s.setExport(true)
 	case n == 0 && s.exporting.Load():
 		s.setExport(false)
 		s.enc.Stop()
-		s.logf("no connected peer: encoder and export stopped")
+		s.audio.Stop()
+		s.logf("no connected peer: encoder and export stopped (audio stopped)")
 	}
 }
-
 func (s *Session) setExport(on bool) {
 	s.exporting.Store(on)
 	if s.link != nil {
@@ -1081,14 +1097,12 @@ func (s *Session) flushActivity() {
 	s.h.push(protocol.EventSlotActivity, protocol.SlotActivity{SessionID: s.ID(), Slots: slots})
 }
 
-// readFrames pumps addon frames into the encoder while exporting. The
-// encoder starts on the first frame after export is switched on, sized from
-// that frame (the session-0 desktop clamps the window), so a viewer's first
-// frame is always an IDR.
-func (s *Session) readFrames() {
+// readMedia demultiplexes addon video and game-process PCM. Audio is copied
+// into a bounded non-blocking queue; video starts on its first frame.
+func (s *Session) readMedia() {
 	var buf []byte
 	for {
-		h, b, err := s.link.ReadFrame(buf)
+		rec, b, err := s.link.ReadRecord(buf)
 		buf = b
 		if err != nil {
 			if s.ctx.Err() == nil {
@@ -1096,28 +1110,34 @@ func (s *Session) readFrames() {
 			}
 			return
 		}
-		if !s.exporting.Load() || h.Kind != link.KindImageRGBA8 {
+		if !s.exporting.Load() {
 			continue
 		}
+		if rec.PCM != nil {
+			s.audio.Submit(rec.Data)
+			continue
+		}
+		if rec.Frame == nil || rec.Frame.Kind != link.KindImageRGBA8 {
+			continue
+		}
+		h := rec.Frame
 		if !s.enc.Running() {
 			if err := s.enc.Start(int(h.Width), int(h.Height)); err != nil {
 				s.fail("encoder: " + err.Error())
 				return
 			}
-			s.logf("encoder started %dx%d %s: %s", h.Width, h.Height, s.start.Encoder.Label(), strings.Join(s.enc.Args, " "))
+			s.logf("encoder started video=%dx%d %s audio=opus/48000/2: %s", h.Width, h.Height, s.start.Encoder.Label(), strings.Join(s.enc.Args, " "))
 		}
-		if err := s.enc.WriteFrame(b); err != nil {
+		if err := s.enc.WriteFrame(rec.Data); err != nil {
 			s.logf("encoder write: %v", err)
 			continue
 		}
 		if s.enc.Counts.Packets.Load() > 0 && !s.liveSent.Swap(true) {
 			p := s.start.Encoder
-			s.status(protocol.StateLive, fmt.Sprintf("Streaming %dx%d at %d fps (%s/%s %d kbps, GOP %d); asked for %dx%d",
-				h.Width, h.Height, p.FPS, p.Preset, p.Tune, p.BitrateKbps, p.GOPFrames, p.Width, p.Height))
+			s.status(protocol.StateLive, fmt.Sprintf("Streaming %dx%d at %d fps (%s/%s %d kbps, GOP %d) with Opus game audio; asked for %dx%d", h.Width, h.Height, p.FPS, p.Preset, p.Tune, p.BitrateKbps, p.GOPFrames, p.Width, p.Height))
 		}
 	}
 }
-
 func (s *Session) cleanup() {
 	// Run what was queued before the end: an offer that finished gathering
 	// is closed by installPeer (the context is done) instead of leaking.
@@ -1141,6 +1161,9 @@ func (s *Session) cleanup() {
 	}
 	if s.enc != nil {
 		s.enc.Stop()
+	}
+	if s.audio != nil {
+		s.audio.Stop()
 	}
 	if s.link != nil {
 		s.sendLines([]input.Out{{"t": "release_all"}})

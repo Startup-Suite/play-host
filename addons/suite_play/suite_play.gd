@@ -20,6 +20,10 @@ extends Node
 ## a v1 key had, so every InputMap action still fires for P1), and pads carry
 ## device d. Every event also carries meta "suite_play_slot" = d.
 ##   game -> host: frames while export is on (frame path C, stage 1).
+## Audio record (little-endian): "SPA1" (version 1), u32 sample rate (48000),
+## u32 channels (2), u32 format (1 = interleaved f32le), u32 sample frames,
+## u32 payload length, bytes. Source is AudioEffectCapture on Master only;
+## no microphone or desktop-loopback API is used.
 ## Frame record (little-endian): "SPF1", u32 width, u32 height, u32 kind
 ## (1 = Image.FORMAT_RGBA8 from get_image, 2 = RD texture bytes), u32 length, bytes.
 ##
@@ -48,6 +52,12 @@ const CELL_PX := 16
 const PROBE_FRAMES := 2
 const MAX_SEQ := 4095
 const SLOT_META := &"suite_play_slot"
+const AUDIO_RATE := 48000
+const AUDIO_CHANNELS := 2
+const AUDIO_FORMAT_F32LE := 1
+const AUDIO_CHUNK_FRAMES := 960  # 20 ms
+const AUDIO_MAX_BACKLOG := 4800  # 100 ms
+const AUDIO_MAX_CHUNKS_PER_TICK := 5
 
 var session_id := ""
 var port := 0
@@ -67,6 +77,16 @@ var _rd_tex := RID()
 var _async_inflight := 0
 var frames_sent := 0
 var probes_seen := 0
+var audio_chunks_sent := 0
+var audio_frames_dropped := 0
+var _capture: AudioEffectCapture
+var _audio_mix_rate := AUDIO_RATE
+# Streaming rational resampler state. Source frames are accumulated until the
+# 48 kHz output clock advances; downsampling averages each covered source
+# window, while an input rate below 48 kHz repeats the current window sample.
+var _audio_resample_clock := 0
+var _audio_resample_sum := Vector2.ZERO
+var _audio_resample_count := 0
 var _keycodes := {}  # name -> Key
 var _held_keys := {}  # "d:keycode:loc" -> [keycode, loc, d]
 var _held_buttons := {}  # "d:b" -> [d, b]
@@ -96,9 +116,8 @@ func _ready() -> void:
 	var err := _server.listen(port, "127.0.0.1")
 	print("suite_play: session=%s port=%d export=%s listen=%s" % [session_id, port, export_mode, error_string(err)])
 	_build_marker()
+	_setup_audio_capture()
 	RenderingServer.frame_post_draw.connect(_on_frame_post_draw)
-
-
 func _build_marker() -> void:
 	_layer = CanvasLayer.new()
 	_layer.layer = 128
@@ -139,6 +158,8 @@ func _process(_delta: float) -> void:
 		_peer.set_no_delay(true)
 		print("suite_play: host connected")
 	if _peer == null:
+		if _capture != null:
+			_capture.clear_buffer()
 		return
 	_peer.poll()
 	if _peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
@@ -159,7 +180,7 @@ func _process(_delta: float) -> void:
 		var line := _rx.slice(0, nl).get_string_from_utf8()
 		_rx = _rx.slice(nl + 1)
 		handle_line(line)
-
+	_drain_audio()
 
 ## One host line. Public so the headless self-test can drive it.
 func handle_line(line: String) -> void:
@@ -181,6 +202,8 @@ func handle_line(line: String) -> void:
 			release_all()
 		"export":
 			exporting = bool(msg.get("on", false)) or export_forced
+			if _capture != null:
+				_capture.clear_buffer()
 			print("suite_play: export %s" % exporting)
 
 
@@ -348,3 +371,93 @@ func _send_frame(w: int, h: int, kind: int, data: PackedByteArray) -> void:
 	_peer.put_data(hdr.data_array)
 	_peer.put_data(data)
 	frames_sent += 1
+
+
+## Installs a pass-through capture effect on the game's Master bus. This sees
+## only PCM mixed by this Godot process. AudioEffectCapture does not record an
+## OS input/output device and does not mute or otherwise alter the bus.
+func _setup_audio_capture() -> void:
+	_audio_mix_rate = int(AudioServer.get_mix_rate())
+	if _audio_mix_rate <= 0:
+		push_error("suite_play: Master mix rate is invalid: %d" % _audio_mix_rate)
+		return
+	var master := AudioServer.get_bus_index("Master")
+	if master < 0:
+		push_error("suite_play: Master bus not found")
+		return
+	_capture = AudioEffectCapture.new()
+	_capture.buffer_length = 0.2
+	AudioServer.add_bus_effect(master, _capture)
+	if _audio_mix_rate == AUDIO_RATE:
+		print("suite_play: capturing Master PCM %d Hz stereo f32le" % AUDIO_RATE)
+	else:
+		print("suite_play: capturing Master PCM %d Hz -> %d Hz stereo f32le" % [_audio_mix_rate, AUDIO_RATE])
+
+
+## Drains at most 100 ms per process tick in 20 ms records. If the game or TCP
+## path falls behind, old samples are discarded instead of building latency.
+func _drain_audio() -> void:
+	if _capture == null or _peer == null or not exporting:
+		return
+	var available := _capture.get_frames_available()
+	var max_backlog := ceili(float(AUDIO_MAX_BACKLOG * _audio_mix_rate) / AUDIO_RATE)
+	if available > max_backlog:
+		var drop := available - max_backlog
+		_capture.get_buffer(drop)
+		audio_frames_dropped += drop
+		available = max_backlog
+	var source_chunk := ceili(float(AUDIO_CHUNK_FRAMES * _audio_mix_rate) / AUDIO_RATE)
+	var chunks := 0
+	while available > 0 and chunks < AUDIO_MAX_CHUNKS_PER_TICK:
+		var count := mini(available, source_chunk)
+		var frames := _capture.get_buffer(count)
+		if frames.is_empty():
+			break
+		_send_audio(_resample_audio(frames))
+		available -= frames.size()
+		chunks += 1
+
+
+## Converts the device/project mix rate to SPA1's fixed 48 kHz clock without
+## resetting phase at capture-buffer boundaries. At Wave's 96 kHz this emits
+## one averaged output frame for each pair of source frames.
+func _resample_audio(frames: PackedVector2Array) -> PackedVector2Array:
+	if _audio_mix_rate == AUDIO_RATE:
+		return frames
+	var out := PackedVector2Array()
+	for frame in frames:
+		_audio_resample_sum += frame
+		_audio_resample_count += 1
+		_audio_resample_clock += AUDIO_RATE
+		var emit := _audio_resample_clock / _audio_mix_rate
+		if emit <= 0:
+			continue
+		_audio_resample_clock %= _audio_mix_rate
+		var sample := _audio_resample_sum / float(_audio_resample_count)
+		for _i in emit:
+			out.append(sample)
+		_audio_resample_sum = Vector2.ZERO
+		_audio_resample_count = 0
+	return out
+
+
+func _send_audio(frames: PackedVector2Array) -> void:
+	if _peer == null or frames.is_empty():
+		return
+	var pcm := PackedFloat32Array()
+	pcm.resize(frames.size() * AUDIO_CHANNELS)
+	for i in frames.size():
+		pcm[i * 2] = frames[i].x
+		pcm[i * 2 + 1] = frames[i].y
+	var data := pcm.to_byte_array()
+	var hdr := StreamPeerBuffer.new()
+	hdr.big_endian = false
+	hdr.put_data("SPA1".to_ascii_buffer())
+	hdr.put_u32(AUDIO_RATE)
+	hdr.put_u32(AUDIO_CHANNELS)
+	hdr.put_u32(AUDIO_FORMAT_F32LE)
+	hdr.put_u32(frames.size())
+	hdr.put_u32(data.size())
+	_peer.put_data(hdr.data_array)
+	_peer.put_data(data)
+	audio_chunks_sent += 1

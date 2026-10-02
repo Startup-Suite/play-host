@@ -51,11 +51,11 @@ func TestFailedOfferIsRetried(t *testing.T) {
 	var calls atomic.Int32
 	real := newPeerGather
 	defer func() { newPeerGather = real }()
-	newPeerGather = func(api *webrtc.API, cfg rtc.Config, track webrtc.TrackLocal, cb rtc.Callbacks) (*rtc.Peer, string, rtc.Gather, error) {
+	newPeerGather = func(api *webrtc.API, cfg rtc.Config, tracks []webrtc.TrackLocal, cb rtc.Callbacks) (*rtc.Peer, string, rtc.Gather, error) {
 		if calls.Add(1) == 1 {
 			return nil, "", rtc.Gather{}, errors.New("ice gathering timed out with no host candidate")
 		}
-		return real(api, cfg, track, cb)
+		return real(api, cfg, tracks, cb)
 	}
 	st := &fakeStages{t: t, port: 40342, prepared: make(chan struct{})}
 	h, c := newTestHost(t, 40342, st)
@@ -82,7 +82,7 @@ func TestOfferRetryIsBounded(t *testing.T) {
 	var calls atomic.Int32
 	real := newPeerGather
 	defer func() { newPeerGather = real }()
-	newPeerGather = func(api *webrtc.API, cfg rtc.Config, track webrtc.TrackLocal, cb rtc.Callbacks) (*rtc.Peer, string, rtc.Gather, error) {
+	newPeerGather = func(api *webrtc.API, cfg rtc.Config, tracks []webrtc.TrackLocal, cb rtc.Callbacks) (*rtc.Peer, string, rtc.Gather, error) {
 		calls.Add(1)
 		return nil, "", rtc.Gather{}, errors.New("boom")
 	}
@@ -114,13 +114,13 @@ func callbackFromFailedPeer(t *testing.T, failAll bool, port int) {
 	var calls atomic.Int32
 	real := newPeerGather
 	defer func() { newPeerGather = real }()
-	newPeerGather = func(api *webrtc.API, cfg rtc.Config, track webrtc.TrackLocal, cb rtc.Callbacks) (*rtc.Peer, string, rtc.Gather, error) {
+	newPeerGather = func(api *webrtc.API, cfg rtc.Config, tracks []webrtc.TrackLocal, cb rtc.Callbacks) (*rtc.Peer, string, rtc.Gather, error) {
 		if n := calls.Add(1); n == 2 || (failAll && n > 1) { // re-offers after the first viewer leaves
 			cb.OnDone("closed")
 			cb.OnConnected()
 			return nil, "", rtc.Gather{}, errors.New("ice gathering timed out")
 		}
-		return real(api, cfg, track, cb)
+		return real(api, cfg, tracks, cb)
 	}
 	rtc.DisconnectGrace = 200 * time.Millisecond
 	st := &fakeStages{t: t, port: port, prepared: make(chan struct{})}

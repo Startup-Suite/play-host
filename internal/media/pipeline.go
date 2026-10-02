@@ -18,19 +18,25 @@ import (
 // the host restarts ffmpeg whenever a viewer connects (so the viewer's first
 // frame is an IDR), and without this the browser would see a jump.
 type Rewriter struct {
-	mu       sync.Mutex
-	started  bool
-	fresh    bool // next packet opens a new encoder epoch
-	seqOff   uint16
-	tsOff    uint32
-	lastSeq  uint16
-	lastTS   uint32
-	lastWall time.Time
-	now      func() time.Time
+	mu        sync.Mutex
+	started   bool
+	fresh     bool // next packet opens a new encoder epoch
+	seqOff    uint16
+	tsOff     uint32
+	lastSeq   uint16
+	lastTS    uint32
+	lastWall  time.Time
+	clockRate uint32
+	now       func() time.Time
 }
 
 // NewRewriter starts with no history.
-func NewRewriter() *Rewriter { return &Rewriter{fresh: true, now: time.Now} }
+func NewRewriter() *Rewriter { return NewRewriterClock(90000) }
+
+// NewRewriterClock creates a rewriter for an RTP media clock.
+func NewRewriterClock(clockRate uint32) *Rewriter {
+	return &Rewriter{fresh: true, clockRate: clockRate, now: time.Now}
+}
 
 // NewEpoch marks the next packet as the first of a new encoder.
 func (r *Rewriter) NewEpoch() { r.mu.Lock(); r.fresh = true; r.mu.Unlock() }
@@ -44,8 +50,8 @@ func (r *Rewriter) Rewrite(pkt *rtp.Packet) {
 		r.fresh = false
 		if r.started {
 			// Continue one past the last sequence number, and advance the
-			// 90 kHz clock by the wall time since the last packet (at least one tick).
-			gap := uint32(max(now.Sub(r.lastWall).Microseconds()*90/1000, 1))
+			// media clock by the wall time since the last packet (at least one tick).
+			gap := uint32(max(now.Sub(r.lastWall).Nanoseconds()*int64(r.clockRate)/int64(time.Second), 1))
 			r.seqOff = r.lastSeq + 1 - pkt.SequenceNumber
 			r.tsOff = r.lastTS + gap - pkt.Timestamp
 		}

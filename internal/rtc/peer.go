@@ -1,4 +1,4 @@
-// Package rtc is the play host's WebRTC side: one sendonly H.264 video track
+// Package rtc is the play host's WebRTC side: one sendonly H.264 video track, one sendonly Opus audio track
 // and two data channels, with the host creating the offer.
 //
 // The RTCP loop that turns PLI/FIR into OnPLI is ported from cloudplay
@@ -222,34 +222,53 @@ func NewVideoTrackRTP() (*webrtc.TrackLocalStaticRTP, error) {
 	}, "video", "play")
 }
 
+// NewAudioTrackRTP is a send-only Opus track fed with ffmpeg RTP packets.
+func NewAudioTrackRTP() (*webrtc.TrackLocalStaticRTP, error) {
+	return webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
+		SDPFmtpLine: "minptime=10;useinbandfec=1",
+	}, "audio", "play")
+}
+
 // NewVideoTrackSample is a track fed with Annex-B access units.
 func NewVideoTrackSample() (*webrtc.TrackLocalStaticSample, error) {
 	return webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "play")
 }
 
 // NewPeer creates the connection, adds track and data channels, and returns
-// the (non-trickle) offer once ICE gathering finishes, or once GatherTimeout
-// expires with at least one host candidate gathered (see GatherTimeout).
+// the (non-trickle) offer once ICE gathering finishes.
 func NewPeer(api *webrtc.API, cfg Config, track webrtc.TrackLocal, cb Callbacks) (*Peer, string, error) {
 	p, sdp, _, err := NewPeerGather(api, cfg, track, cb)
 	return p, sdp, err
 }
 
-// NewPeerGather is NewPeer that also reports how gathering went.
+// NewPeerGather is the one-track compatibility entry point.
 func NewPeerGather(api *webrtc.API, cfg Config, track webrtc.TrackLocal, cb Callbacks) (*Peer, string, Gather, error) {
+	return NewPeerGatherTracks(api, cfg, []webrtc.TrackLocal{track}, cb)
+}
+
+// NewPeerGatherTracks adds every track as a send-only transceiver. The play
+// host supplies its shared video and audio tracks here, producing both m-lines
+// in one offer with one stream id so browsers can synchronize them.
+func NewPeerGatherTracks(api *webrtc.API, cfg Config, tracks []webrtc.TrackLocal, cb Callbacks) (*Peer, string, Gather, error) {
 	var g Gather
 	t0 := time.Now()
+	if len(tracks) == 0 {
+		return nil, "", g, errors.New("peer needs at least one media track")
+	}
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: cfg.ICEServers})
 	if err != nil {
 		return nil, "", g, err
 	}
-	p := &Peer{pc: pc, Track: track, cb: cb}
-	tr, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
-	if err != nil {
-		pc.Close()
-		return nil, "", g, err
+	p := &Peer{pc: pc, Track: tracks[0], cb: cb}
+	for _, track := range tracks {
+		tr, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+		if err != nil {
+			pc.Close()
+			return nil, "", g, err
+		}
+		go p.readRTCP(tr.Sender())
 	}
-	go p.readRTCP(tr.Sender())
 
 	f, zero := false, uint16(0)
 	for _, dc := range []struct {

@@ -42,23 +42,29 @@ func fakeFFmpeg() {
 			url = strings.TrimPrefix(strings.SplitN(a, "?", 2)[0], "rtp://")
 		}
 	}
-	var w, h int
-	fmt.Sscanf(size, "%dx%d", &w, &h)
 	c, err := net.Dial("udp4", url)
 	if err != nil {
 		os.Exit(3)
 	}
-	buf := make([]byte, w*h*4)
-	seq := uint16(1)
+	payloadType, step := uint8(96), uint32(1500)
+	var buf []byte
+	if size == "" {
+		payloadType, step, buf = 111, 480, make([]byte, 8)
+	} else {
+		var w, h int
+		fmt.Sscanf(size, "%dx%d", &w, &h)
+		buf = make([]byte, w*h*4)
+	}
+	seq, timestamp := uint16(1), uint32(1500)
 	for {
 		if _, err := io.ReadFull(os.Stdin, buf); err != nil {
 			return
 		}
-		// A tiny valid-looking H.264 IDR NAL; the test viewer only counts packets.
-		pkt := rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: seq, Timestamp: uint32(seq) * 1500, Marker: true}, Payload: []byte{0x65, 0x88, 0x84, 0x00}}
+		pkt := rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: payloadType, SequenceNumber: seq, Timestamp: timestamp, Marker: true}, Payload: []byte{0x65, 0x88, 0x84, 0x00}}
 		b, _ := pkt.Marshal()
 		c.Write(b)
 		seq++
+		timestamp += step
 	}
 }
 

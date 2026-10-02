@@ -35,24 +35,32 @@ func fakeFFmpeg() {
 			url = strings.TrimPrefix(strings.SplitN(a, "?", 2)[0], "rtp://")
 		}
 	}
-	var w, h int
-	fmt.Sscanf(size, "%dx%d", &w, &h)
 	c, err := net.Dial("udp4", url)
 	if err != nil {
 		os.Exit(3)
 	}
 	seq := uint16(os.Getpid() * 7919)
 	ts := uint32(os.Getpid()) * 104729
-	buf := make([]byte, w*h*4)
+	payloadType := uint8(96)
+	step := uint32(1500)
+	var buf []byte
+	if size == "" {
+		payloadType, step = 111, 480
+		buf = make([]byte, AudioChannels*4)
+	} else {
+		var w, h int
+		fmt.Sscanf(size, "%dx%d", &w, &h)
+		buf = make([]byte, w*h*4)
+	}
 	for {
 		if _, err := io.ReadFull(os.Stdin, buf); err != nil {
 			os.Exit(0)
 		}
-		pkt := rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: seq, Timestamp: ts, Marker: true}, Payload: []byte{0x65, buf[0]}}
+		pkt := rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: payloadType, SequenceNumber: seq, Timestamp: ts, Marker: true}, Payload: []byte{0x65, buf[0]}}
 		b, _ := pkt.Marshal()
 		c.Write(b)
 		seq++
-		ts += 1500
+		ts += step
 	}
 }
 
