@@ -47,6 +47,13 @@ type FileConfig struct {
 	HeartbeatS      int          `json:"heartbeat_s"`
 	LaunchTimeoutS  int          `json:"launch_timeout_s"`
 	ProgressEveryMs int          `json:"progress_every_ms"`
+	// DEV RIGS ONLY (task 01a0fe45 stage 5); prod config.json sets neither.
+	// LogTouch logs every st/sd line sent to the addon. Features, when
+	// present, replaces client_info.features: ["game_stream_host",
+	// "game_stream_multi"] runs a host WITHOUT game_stream_touch, the
+	// negative control for core's touch gate. Absent = the default set.
+	LogTouch bool     `json:"log_touch"`
+	Features []string `json:"features"`
 }
 
 // LoadConfig reads and checks the config file.
@@ -91,6 +98,7 @@ func (c FileConfig) hostConfig() host.Config {
 		ImportTimeout: time.Duration(c.ImportTimeoutS) * time.Second,
 		LinkTimeout:   time.Duration(c.LaunchTimeoutS) * time.Second,
 		ProgressEvery: time.Duration(c.ProgressEveryMs) * time.Millisecond,
+		LogTouch:      c.LogTouch,
 		Build: build.Config{Git: c.Git, SSH: c.SSH, KnownHosts: c.KnownHosts, MirrorsDir: c.MirrorsDir,
 			CheckoutsDir: c.CheckoutsDir, AddonDir: c.AddonDir, Repos: c.Repos, KeepCheckouts: c.KeepCheckouts},
 	}
@@ -111,6 +119,9 @@ func serve(args []string) error {
 	defer lf.Close()
 	defer logPanic()
 	log.Printf("play-host %s serve: runtime %s via %s", Version, c.RuntimeID, c.SuiteURL)
+	if c.LogTouch || c.Features != nil {
+		log.Printf("play-host: dev config: log_touch=%v features=%v", c.LogTouch, c.Features)
+	}
 
 	hc := c.hostConfig()
 	hc.PionLog = log.Writer()
@@ -119,7 +130,7 @@ func serve(args []string) error {
 	h.SweepCheckouts(sweepCtx)
 	sweepDone()
 	cl := suite.New(suite.Config{URL: c.SuiteURL, RuntimeID: c.RuntimeID, TokenFile: c.TokenFile, Product: "play-host",
-		Version: Version, Heartbeat: time.Duration(c.HeartbeatS) * time.Second}, h)
+		Version: Version, Heartbeat: time.Duration(c.HeartbeatS) * time.Second, Features: c.Features}, h)
 	h.SetSender(cl)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()

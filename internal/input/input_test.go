@@ -3,7 +3,9 @@ package input
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"testing"
+	"time"
 )
 
 func h(t *testing.T, tr *Binding, label, msg string) Result {
@@ -174,4 +176,155 @@ func pad2(slot int) string {
 	b[3] = 1
 	m, _ := json.Marshal(map[string]any{"t": "pad", "slot": slot, "seq": 1, "buttons": b, "axes": []float64{0, 0, 0, 0}})
 	return string(m)
+}
+
+// fakeClock replaces a translator's clock; each call to step advances it.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time       { return c.t }
+func (c *fakeClock) step(d time.Duration) { c.t = c.t.Add(d) }
+func clocked(b *Binding) *fakeClock       { c := &fakeClock{t: time.Unix(1, 0)}; b.tr.now = c.now; return c }
+func touch(id int, ph string, x, y float64) string {
+	return fmt.Sprintf(`{"t":"touch","src":0,"id":%d,"ph":%q,"x":%v,"y":%v}`, id, ph, x, y)
+}
+
+// Touch encode table (task 01a0fe45, core protocol.ex "Touch"): down is st
+// pressed, move is sd, up is st released, cancel is st canceled, and the
+// Godot index is slot*10+id.
+func TestTouchEncodeTable(t *testing.T) {
+	b := NewBinding()
+	b.SetSlots(map[int]int{0: 2})
+	clk := clocked(b)
+	rows := []struct{ msg, want string }{
+		{touch(0, "down", 0.42, 0.77), `{"c":false,"d":2,"i":20,"p":true,"t":"st","x":0.42,"y":0.77}`},
+		{touch(0, "move", 0.45, 0.7), `{"d":2,"i":20,"t":"sd","x":0.45,"y":0.7}`},
+		{touch(0, "down", 0.5, 0.6), `{"d":2,"i":20,"t":"sd","x":0.5,"y":0.6}`}, // down on a held id is a move
+		{touch(3, "down", 0, 1), `{"c":false,"d":2,"i":23,"p":true,"t":"st","x":0,"y":1}`},
+		{touch(0, "up", 0.5, 0.61), `{"c":false,"d":2,"i":20,"p":false,"t":"st","x":0.5,"y":0.61}`},
+		{touch(3, "cancel", 0.1, 0.9), `{"c":true,"d":2,"i":23,"p":false,"t":"st","x":0.1,"y":0.9}`},
+		{touch(9, "down", 1, 0), `{"c":false,"d":2,"i":29,"p":true,"t":"st","x":1,"y":0}`},
+	}
+	for _, r := range rows {
+		clk.step(10 * time.Millisecond)
+		got := h(t, b, "input-events", r.msg)
+		if lines(got) != r.want || !got.Activity || got.Slot != 2 || got.Dropped != "" {
+			t.Errorf("%s:\n got %q %+v\nwant %q", r.msg, lines(got), got, r.want)
+		}
+	}
+}
+
+// Malformed touches are dropped as DropBadTouch, never as activity, and a
+// move/up/cancel on an id the slot does not hold is ignored (no line, no
+// drop), like a key up without a down.
+func TestTouchValidationAndUnheld(t *testing.T) {
+	b := NewBinding()
+	b.SetSlots(map[int]int{0: 0})
+	clk := clocked(b)
+	bad := []string{
+		`{"t":"touch","src":0,"id":10,"ph":"down","x":0.5,"y":0.5}`,
+		`{"t":"touch","src":0,"id":-1,"ph":"down","x":0.5,"y":0.5}`,
+		`{"t":"touch","src":0,"id":0,"ph":"hover","x":0.5,"y":0.5}`,
+		`{"t":"touch","src":0,"id":0,"x":0.5,"y":0.5}`,
+		`{"t":"touch","src":0,"id":0,"ph":"down","y":0.5}`,
+		`{"t":"touch","src":0,"id":0,"ph":"down","x":0.5}`,
+		`{"t":"touch","src":0,"id":0,"ph":"down","x":1.0001,"y":0.5}`,
+		`{"t":"touch","src":0,"id":0,"ph":"down","x":0.5,"y":-0.01}`,
+		`{"t":"touch","src":0,"id":0,"ph":"down","x":null,"y":0.5}`,
+	}
+	for _, m := range bad {
+		clk.step(10 * time.Millisecond)
+		if r := h(t, b, "input-events", m); r.Dropped != DropBadTouch || len(r.Lines) != 0 || r.Activity {
+			t.Errorf("%s: %+v", m, r)
+		}
+	}
+	// NaN and Inf cannot be spelled in JSON, so check them on Touch itself.
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		v, ok := v, 0.5
+		for _, m := range []Browser{{T: "touch", Ph: "down", X: &v, Y: &ok}, {T: "touch", Ph: "down", X: &ok, Y: &v}} {
+			if r := b.tr.Touch(m, 0); r.Dropped != DropBadTouch || len(r.Lines) != 0 {
+				t.Errorf("%v: %+v", v, r)
+			}
+		}
+	}
+	for _, ph := range []string{"move", "up", "cancel"} {
+		clk.step(10 * time.Millisecond)
+		if r := h(t, b, "input-events", touch(4, ph, 0.5, 0.5)); len(r.Lines) != 0 || r.Dropped != "" || r.Activity {
+			t.Errorf("unheld %s: %+v", ph, r)
+		}
+	}
+	// Nothing above left a touch held: a release lifts nothing.
+	if got := b.Release(); fmt.Sprint(got) != `[map[d:0 t:release]]` {
+		t.Fatalf("release after only bad/unheld touches: %v", got)
+	}
+}
+
+// The rate bound: a move for a (slot, id) under 4 ms after the previous
+// line for it is dropped as DropTouchRate; another id, or the same id 4 ms
+// on, passes. up is never rate-bounded.
+func TestTouchRateBound(t *testing.T) {
+	b := NewBinding()
+	b.SetSlots(map[int]int{0: 0})
+	clk := clocked(b)
+	h(t, b, "input-events", touch(0, "down", 0.1, 0.1))
+	h(t, b, "input-events", touch(1, "down", 0.2, 0.2))
+	clk.step(TouchMinInterval - time.Microsecond)
+	if r := h(t, b, "input-events", touch(0, "move", 0.3, 0.3)); r.Dropped != DropTouchRate || len(r.Lines) != 0 || r.Activity {
+		t.Fatalf("fast move: %+v", r)
+	}
+	if r := h(t, b, "input-events", touch(0, "down", 0.3, 0.3)); r.Dropped != DropTouchRate {
+		t.Fatalf("fast down-as-move: %+v", r)
+	}
+	clk.step(time.Microsecond)
+	if r := h(t, b, "input-events", touch(0, "move", 0.3, 0.3)); lines(r) != `{"d":0,"i":0,"t":"sd","x":0.3,"y":0.3}` {
+		t.Fatalf("move at 4 ms: %+v", r)
+	}
+	if r := h(t, b, "input-events", touch(1, "move", 0.4, 0.4)); lines(r) != `{"d":0,"i":1,"t":"sd","x":0.4,"y":0.4}` {
+		t.Fatalf("other id at its own 4 ms: %+v", r)
+	}
+	// Immediately after an accepted move, a second one is bounded again,
+	// but an up is not.
+	if r := h(t, b, "input-events", touch(0, "move", 0.35, 0.35)); r.Dropped != DropTouchRate {
+		t.Fatalf("second fast move: %+v", r)
+	}
+	if r := h(t, b, "input-events", touch(0, "up", 0.36, 0.36)); lines(r) != `{"c":false,"d":0,"i":0,"p":false,"t":"st","x":0.36,"y":0.36}` {
+		t.Fatalf("up right after a move: %+v", r)
+	}
+}
+
+// ReleaseSlot lifts only that slot's touches, as canceled touches at their
+// last ACCEPTED position, in id order, before the slot's release line.
+func TestReleaseSlotLiftsOnlyThatSlotsTouches(t *testing.T) {
+	tr := NewTranslator()
+	c := &fakeClock{t: time.Unix(1, 0)}
+	tr.now = c.now
+	x := func(v float64) *float64 { return &v }
+	tr.Touch(Browser{Ph: "down", ID: 2, X: x(0.2), Y: x(0.3)}, 0)
+	tr.Touch(Browser{Ph: "down", ID: 0, X: x(0.1), Y: x(0.1)}, 0)
+	tr.Touch(Browser{Ph: "down", ID: 0, X: x(0.9), Y: x(0.9)}, 1)
+	c.step(5 * time.Millisecond)
+	tr.Touch(Browser{Ph: "move", ID: 2, X: x(0.25), Y: x(0.35)}, 0)
+	tr.Touch(Browser{Ph: "move", ID: 2, X: x(0.5), Y: x(0.5)}, 0) // rate-dropped: not the last position
+	got := fmt.Sprint(tr.ReleaseSlot(0))
+	want := `[map[c:true d:0 i:0 p:false t:st x:0.1 y:0.1] map[c:true d:0 i:2 p:false t:st x:0.25 y:0.35] map[d:0 t:release]]`
+	if got != want {
+		t.Fatalf("ReleaseSlot(0):\n got %s\nwant %s", got, want)
+	}
+	if got := fmt.Sprint(tr.ReleaseSlot(0)); got != `[map[d:0 t:release]]` {
+		t.Fatalf("second ReleaseSlot(0) lifted again: %s", got)
+	}
+	// Slot 1's touch survived slot 0's release; ReleaseAll lifts it.
+	if got := fmt.Sprint(tr.ReleaseAll()); got != `[map[c:true d:1 i:10 p:false t:st x:0.9 y:0.9] map[t:release_all]]` {
+		t.Fatalf("ReleaseAll: %s", got)
+	}
+}
+
+// A browser release_all lifts the peer's touches on each of its slots.
+func TestBrowserReleaseAllLiftsTouches(t *testing.T) {
+	b := NewBinding()
+	b.SetSlots(map[int]int{0: 1})
+	clocked(b)
+	h(t, b, "input-events", touch(5, "down", 0.5, 0.5))
+	if r := h(t, b, "input-events", `{"t":"release_all"}`); lines(r) != `{"c":true,"d":1,"i":15,"p":false,"t":"st","x":0.5,"y":0.5} {"d":1,"t":"release"}` {
+		t.Fatalf("release_all: %q", lines(r))
+	}
 }

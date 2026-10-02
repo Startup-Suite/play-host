@@ -44,6 +44,18 @@
 // the host does not, play_peer_close for each the host holds that it does
 // not, and a fresh play_slots. An old core ignores the two keys and has
 // already failed the session, so the host's grace just runs out.
+//
+// Touch (task 01a0fe45, core protocol.ex "Touch"). The host declares
+// client_info.features "game_stream_touch" (internal/suite FeatureTouch);
+// core turns the browser's touch surface on only for a host that does. The
+// frames themselves never pass through core:
+//
+//	browser -> host  input-events  {"t":"touch","src":0,"id":0..9,"ph":"down|move|up|cancel","x":0..1,"y":0..1}
+//	host -> addon    link          {"t":"st","d":slot,"i":slot*10+id,"p":bool,"c":bool,"x":..,"y":..}
+//	host -> addon    link          {"t":"sd","d":slot,"i":slot*10+id,"x":..,"y":..}
+//
+// The slot comes from play_slots, never the message; internal/input
+// validates, rate-bounds and releases them.
 package protocol
 
 import (

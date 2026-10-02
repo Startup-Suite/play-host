@@ -86,6 +86,10 @@ type Config struct {
 	// behaviour). The viewers' media never passes through core, so they keep
 	// watching while the socket reconnects; see protocol "Resume".
 	ResumeGrace time.Duration
+	// LogTouch logs one line per touch line (st/sd) sent to the addon,
+	// releases included (task 01a0fe45 stage 5). DEV RIGS ONLY: a held
+	// drag is up to 60 lines/s per finger. Config key "log_touch".
+	LogTouch bool
 }
 
 // DefaultResumeGrace bounds a suite reconnect that keeps the session. Core's
@@ -1010,6 +1014,10 @@ func (s *Session) sendLines(lines []input.Out) {
 		if err := s.link.Send(l); err != nil {
 			s.logf("addon link send: %v", err)
 			return
+		}
+		if s.h.cfg.LogTouch && (l["t"] == "st" || l["t"] == "sd") {
+			b, _ := json.Marshal(l)
+			s.logf("touch line %s", b)
 		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Startup-Suite/play-host/internal/input"
 	"github.com/Startup-Suite/play-host/internal/protocol"
 	"github.com/Startup-Suite/play-host/internal/rtc"
 	"github.com/pion/webrtc/v4"
@@ -424,5 +425,89 @@ func dropsFor(s *Session, id string) int64 {
 		return n
 	case <-time.After(2 * time.Second):
 		return -1
+	}
+}
+
+// Touch at the session level (task 01a0fe45): a spectator's forged touch,
+// with or without a `slot`, produces no addon line and is counted against
+// its peer; a player's touch (the positive control) reaches the addon on its
+// table slot with Godot index slot*10+id, and a leave lifts it.
+func TestSpectatorTouchDroppedPlayerTouchReachesTheAddon(t *testing.T) {
+	const port = 40370
+	lr := &logRec{t: t}
+	st := &fakeStages{t: t, port: port, prepared: make(chan struct{})}
+	h, c := newTestHostLog(t, port, st, lr.logf)
+	t.Cleanup(func() { stopAndWait(t, h, "t1") })
+	h.OnEvent(protocol.EventSessionStart, startPayload("t1", 600))
+	peerOpen(h, "t1", "p")
+	peerOpen(h, "t1", "s")
+	slots(h, "t1", 2, map[string]map[string]int{"p": {"0": 1}, "s": {}})
+	p := attach(t, h, c, "p", 0)
+	sp := attach(t, h, c, "s", 0)
+	growing(t, "spectator has video", sp.pkts)
+	eventually(t, "export on", func() bool { return st.game.sawLine(`"on":true`) })
+	before := len(inputLines(st.game.snapshot()))
+
+	sp.events.SendText(`{"t":"touch","src":0,"id":0,"ph":"down","x":0.5,"y":0.5}`)
+	sp.events.SendText(`{"t":"touch","src":0,"id":0,"ph":"down","x":0.5,"y":0.5,"slot":0}`)
+	eventually(t, "2 drops counted for s", func() bool { return dropsFor(h.Current(), "s") == 2 })
+
+	p.events.SendText(`{"t":"touch","src":0,"id":3,"ph":"down","x":0.25,"y":0.75,"slot":0}`)
+	eventually(t, "p's touch on d:1", func() bool { return st.game.sawLine(`"t":"st"`) })
+	after := inputLines(st.game.snapshot())[before:]
+	if fmt.Sprint(after) != `[{"c":false,"d":1,"i":13,"p":true,"t":"st","x":0.25,"y":0.75}]` {
+		t.Fatalf("addon lines after the touches:\n%s", strings.Join(after, "\n"))
+	}
+	if got := lr.find("peer s: dropped"); len(got) == 0 || !strings.Contains(got[0], "no slot") {
+		t.Fatalf("no drop line against peer s: %v", got)
+	}
+	if n := dropsFor(h.Current(), "p"); n != 0 {
+		t.Fatalf("player's touch counted as a drop: %d", n)
+	}
+
+	// The player leaves its slot: the held touch is lifted, canceled.
+	slots(h, "t1", 2, map[string]map[string]int{"p": {}, "s": {}})
+	eventually(t, "touch lifted on leave", func() bool {
+		return st.game.sawLine(`{"c":true,"d":1,"i":13,"p":false,"t":"st","x":0.25,"y":0.75}`)
+	})
+}
+
+// Task 01a0fe45 stage 5: with LogTouch on, every st/sd line sent to the
+// addon is logged once, releases included; with it off (prod), none is.
+func TestLogTouchLogsEverySentTouchLine(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		t.Run(fmt.Sprint("log_touch=", on), func(t *testing.T) {
+			const port = 40374
+			lr := &logRec{t: t}
+			st := &fakeStages{t: t, port: port, prepared: make(chan struct{})}
+			h, c := newTestHostLog(t, port, st, lr.logf)
+			h.cfg.LogTouch = on
+			t.Cleanup(func() { stopAndWait(t, h, "t1") })
+			h.OnEvent(protocol.EventSessionStart, startPayload("t1", 600))
+			peerOpen(h, "t1", "p")
+			slots(h, "t1", 1, map[string]map[string]int{"p": {"0": 0}})
+			p := attach(t, h, c, "p", 0)
+			eventually(t, "export on", func() bool { return st.game.sawLine(`"on":true`) })
+
+			p.events.SendText(`{"t":"touch","src":0,"id":2,"ph":"down","x":0.25,"y":0.5}`)
+			eventually(t, "down reached the addon", func() bool { return st.game.sawLine(`"t":"st"`) })
+			time.Sleep(2 * input.TouchMinInterval) // a sooner move is dropped as "touch rate"
+			p.events.SendText(`{"t":"touch","src":0,"id":2,"ph":"move","x":0.3,"y":0.5}`)
+			eventually(t, "drag reached the addon", func() bool { return st.game.sawLine(`"t":"sd"`) })
+			p.events.SendText(`{"t":"key","src":0,"code":"KeyA","down":true}`)
+			slots(h, "t1", 1, map[string]map[string]int{"p": {}})
+			eventually(t, "touch lifted", func() bool { return st.game.sawLine(`"c":true,"d":0,"i":2`) })
+
+			want := 0
+			if on {
+				want = 3 // st down, sd, st canceled release
+			}
+			if n := lr.count("touch line "); n != want {
+				t.Fatalf("touch line logs = %d, want %d", n, want)
+			}
+			if on && lr.count(`touch line {"c":true,"d":0,"i":2,"p":false,"t":"st","x":0.3,"y":0.5}`) != 1 {
+				t.Fatalf("release line not logged exactly once")
+			}
+		})
 	}
 }
