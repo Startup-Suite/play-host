@@ -9,6 +9,7 @@ extends SceneTree
 ## It measures the plan's RISK directly: does Input.parse_input_event update
 ## the RAW state (Input.is_physical_key_pressed, Input.get_joy_axis,
 ## Input.is_joy_button_pressed), not only InputMap actions?
+## Task 01a0fe45 stage 4 adds touch (st/sd): see _touch_suite.
 
 var failures: Array[String] = []
 
@@ -88,6 +89,8 @@ func _two_devices(sp: Node) -> void:
 
 
 func _process(_delta: float) -> bool:
+	if _touch_started:
+		return false
 	_frames += 1
 	if _frames == 1:
 		_sp.handle_line('{"t":"key","d":0,"k":"D","loc":0,"p":true,"e":false}')
@@ -137,6 +140,244 @@ func _process(_delta: float) -> bool:
 	Input.flush_buffered_events()
 	_check(not Input.is_joy_button_pressed(0, JOY_BUTTON_A) and is_zero_approx(Input.get_joy_axis(0, JOY_AXIS_LEFT_X)) and not Input.is_physical_key_pressed(KEY_D), "release_all still releases every device")
 
+	_touch_started = true
+	_touch_suite()
+	return false
+
+
+## ---- Touch (task 01a0fe45 stage 4) ----
+##
+## The host sends st/sd with x, y normalised to the exported frame (the root
+## viewport texture). In every stretch configuration below the test computes
+## the expected normalised point for a canvas point c independently of the
+## addon, as c / root.get_visible_rect().size (the canvas fills the texture;
+## black bars are outside it), and asserts the texture size Godot's own
+## Window::_update_viewport_size formula predicts, by hand, for that row.
+## Each row then checks, through the real Viewport GUI path:
+##   positive control: a direct InputEventMouseButton at the Button centre
+##     (window coords from root.get_final_transform()) fires pressed once;
+##   tap: st down/up at the Button centre fires pressed EXACTLY once;
+##   canceled: st down, st up c:true fires it 0 times;
+##   _input sees the touch at the expected canvas point (within 1 px);
+##   an sd drag inside the ScrollContainer changes scroll_vertical.
+## Rows (mode, aspect, base content size, window size):
+const ROWS := [
+	["disabled portrait", Window.CONTENT_SCALE_MODE_DISABLED, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(0, 0), Vector2i(450, 1000), Vector2i(450, 1000)],
+	["disabled landscape", Window.CONTENT_SCALE_MODE_DISABLED, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(0, 0), Vector2i(1600, 900), Vector2i(1600, 900)],
+	# Survival Game at 3c921947 project.godot: viewport 450x1000, window
+	# override 450x1000, stretch mode canvas_items, aspect unset (keep).
+	["survival-game@3c92194 canvas_items keep 450x1000 in 450x1000", Window.CONTENT_SCALE_MODE_CANVAS_ITEMS, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(450, 1000), Vector2i(450, 1000), Vector2i(450, 1000)],
+	["canvas_items keep 450x1000 in landscape 1600x900 (bars)", Window.CONTENT_SCALE_MODE_CANVAS_ITEMS, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(450, 1000), Vector2i(1600, 900), Vector2i(405, 900)],
+	["canvas_items keep 1600x900 in landscape 1600x900", Window.CONTENT_SCALE_MODE_CANVAS_ITEMS, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(1600, 900), Vector2i(1600, 900), Vector2i(1600, 900)],
+	["canvas_items keep 1600x900 in portrait 900x1600 (bars)", Window.CONTENT_SCALE_MODE_CANVAS_ITEMS, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(1600, 900), Vector2i(900, 1600), Vector2i(900, 506)],
+	["canvas_items expand 450x1000 in portrait 900x1600", Window.CONTENT_SCALE_MODE_CANVAS_ITEMS, Window.CONTENT_SCALE_ASPECT_EXPAND, Vector2i(450, 1000), Vector2i(900, 1600), Vector2i(900, 1600)],
+	["canvas_items expand 450x1000 in landscape 1600x900", Window.CONTENT_SCALE_MODE_CANVAS_ITEMS, Window.CONTENT_SCALE_ASPECT_EXPAND, Vector2i(450, 1000), Vector2i(1600, 900), Vector2i(1600, 900)],
+	["viewport keep 450x1000 in portrait 900x1600 (bars)", Window.CONTENT_SCALE_MODE_VIEWPORT, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(450, 1000), Vector2i(900, 1600), Vector2i(450, 1000)],
+	["viewport keep 450x1000 in landscape 1600x900 (bars)", Window.CONTENT_SCALE_MODE_VIEWPORT, Window.CONTENT_SCALE_ASPECT_KEEP, Vector2i(450, 1000), Vector2i(1600, 900), Vector2i(450, 1000)],
+]
+
+var _touch_rec: Node
+var _touch_started := false
+var _presses := 0
+
+
+func _frames_wait(n: int) -> void:
+	for _i in n:
+		await process_frame
+
+
+func _flush() -> void:
+	Input.flush_buffered_events()
+	await _frames_wait(2)
+
+
+func _on_pressed() -> void:
+	_presses += 1
+
+
+func _touch_suite() -> void:
+	var gd := GDScript.new()
+	gd.source_code = "extends Node\nvar got: Array = []\nfunc _input(e: InputEvent) -> void:\n\tif e is InputEventScreenTouch:\n\t\tgot.append([\"st\", e.index, e.pressed, e.canceled, e.position, e.get_meta(&\"suite_play_slot\", -1), e.device])\n\telif e is InputEventScreenDrag:\n\t\tgot.append([\"sd\", e.index, e.position, e.relative, e.get_meta(&\"suite_play_slot\", -1), e.velocity])\n"
+	gd.reload()
+	_touch_rec = gd.new()
+	root.add_child(_touch_rec)
+	print("INFO touch: emulate_mouse_from_touch=%s emulate_touch_from_mouse=%s is_touchscreen_available=%s (before any touch line)" % [Input.is_emulating_mouse_from_touch(), Input.is_emulating_touch_from_mouse(), DisplayServer.is_touchscreen_available()])
+	var first := true
+	for row in ROWS:
+		await _touch_row(row, first)
+		first = false
+	await _touch_release()
 	print("SELFTEST %s (%d failures)" % ["PASS" if failures.is_empty() else "FAIL", failures.size()])
 	quit(0 if failures.is_empty() else 1)
-	return true
+
+
+func _norm(c: Vector2) -> Vector2:
+	return c / root.get_visible_rect().size
+
+
+func _st(d: int, i: int, p: bool, c: bool, n: Vector2) -> void:
+	_sp.handle_line(JSON.stringify({"t": "st", "d": d, "i": i, "p": p, "c": c, "x": n.x, "y": n.y}))
+
+
+func _sd(d: int, i: int, n: Vector2) -> void:
+	_sp.handle_line(JSON.stringify({"t": "sd", "d": d, "i": i, "x": n.x, "y": n.y}))
+
+
+func _touch_row(row: Array, first: bool) -> void:
+	var name: String = row[0]
+	root.content_scale_mode = row[1]
+	root.content_scale_aspect = row[2]
+	root.content_scale_size = row[3]
+	root.size = row[4]
+	var holder := Control.new()
+	holder.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(holder)
+	await _frames_wait(2)
+	var vis := root.get_visible_rect().size
+	holder.position = Vector2.ZERO
+	holder.size = vis
+	var button := Button.new()
+	button.text = "tap"
+	button.position = (vis * Vector2(0.1, 0.05)).floor()
+	button.size = (vis * Vector2(0.4, 0.08)).floor()
+	button.pressed.connect(_on_pressed)
+	holder.add_child(button)
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.position = (vis * Vector2(0.1, 0.3)).floor()
+	scroll.size = (vis * Vector2(0.8, 0.5)).floor()
+	holder.add_child(scroll)
+	var content := Control.new()
+	content.mouse_filter = Control.MOUSE_FILTER_PASS
+	content.custom_minimum_size = (vis * Vector2(0.7, 3.0)).floor()
+	scroll.add_child(content)
+	await _frames_wait(3)
+	var fs: Vector2 = _sp.frame_size()
+	var want_fs: Vector2i = row[5]
+	var img := root.get_texture().get_image()
+	var img_size := Vector2i(-1, -1) if img == null or img.is_empty() else img.get_size()
+	print("INFO [%s] window=%s visible=%s frame_size=%s texture.get_size=%s image=%s final=%s stretch=%s" % [name, root.size, vis, fs, root.get_texture().get_size(), img_size, root.get_final_transform(), root.get_stretch_transform()])
+	_check(Vector2i(fs.round()) == want_fs, "[%s] frame_size() is %s, the render size Godot's stretch formula predicts by hand (got %s)" % [name, want_fs, fs])
+	if img_size.x >= 0:
+		_check(img_size == want_fs, "[%s] the exported image (root get_image) is %s (got %s)" % [name, want_fs, img_size])
+	else:
+		print("INFO [%s] no exported image under this renderer (headless dummy); image size unmeasured here" % name)
+
+	var centre := button.get_global_rect().get_center()
+	# Positive control: a direct mouse click in window coordinates.
+	var wpos := root.get_final_transform() * centre
+	_presses = 0
+	var mm := InputEventMouseMotion.new()
+	mm.position = wpos
+	mm.global_position = wpos
+	Input.parse_input_event(mm)
+	for down in [true, false]:
+		var mb := InputEventMouseButton.new()
+		mb.button_index = MOUSE_BUTTON_LEFT
+		mb.pressed = down
+		mb.button_mask = MOUSE_BUTTON_MASK_LEFT if down else 0
+		mb.position = wpos
+		mb.global_position = wpos
+		Input.parse_input_event(mb)
+		await _flush()
+	_check(_presses == 1, "[%s] POSITIVE CONTROL: a direct InputEventMouseButton at the Button centre fires pressed once (fired %d)" % [name, _presses])
+
+	if first:
+		# Without emulate_touch_from_mouse the drag must NOT scroll: shows the
+		# addon's switch is what makes ScrollContainer touch-scroll work.
+		_sp.touchscreen_on_touch = false
+		Input.emulate_touch_from_mouse = false
+		var moved0: float = await _drag(scroll)
+		_check(is_zero_approx(moved0), "[%s] with is_touchscreen_available()=false an sd drag does not scroll (moved %.1f): ScrollContainer needs it" % [name, moved0])
+		_sp.touchscreen_on_touch = true
+
+	# Tap.
+	_presses = 0
+	_touch_rec.got.clear()
+	_st(0, 0, true, false, _norm(centre))
+	await _flush()
+	_st(0, 0, false, false, _norm(centre))
+	await _flush()
+	_check(_presses == 1, "[%s] tap (st down/up at the Button centre) fires pressed EXACTLY once (fired %d)" % [name, _presses])
+	var seen_at: Variant = null
+	for g in _touch_rec.got:
+		if g[0] == "st" and g[1] == 0 and g[2]:
+			seen_at = g[4]
+	_check(seen_at != null and (seen_at as Vector2).distance_to(centre) <= 1.0, "[%s] _input sees the touch at canvas %s (expected %s)" % [name, seen_at, centre])
+	_check(not _touch_rec.got.is_empty() and _touch_rec.got[0][5] == 0, "[%s] touch carries meta suite_play_slot 0" % name)
+
+	# Canceled touch.
+	_presses = 0
+	_st(0, 0, true, false, _norm(centre))
+	await _flush()
+	_st(0, 0, false, true, _norm(centre))
+	await _flush()
+	_check(_presses == 0, "[%s] canceled touch (c:true) fires pressed 0 times (fired %d)" % [name, _presses])
+
+	# Two players: slot 0 holds touch 0 on empty space (so it owns the
+	# emulated mouse), slot 1 taps the Button with touch 10. Godot 4.7.2
+	# BaseButton also reads non-emulated ScreenTouch (base_button.cpp:66), so
+	# measure what the second player's tap does.
+	_presses = 0
+	_st(0, 0, true, false, Vector2(0.95, 0.97))
+	await _flush()
+	_st(1, 10, true, false, _norm(centre))
+	await _flush()
+	_st(1, 10, false, false, _norm(centre))
+	await _flush()
+	var p2 := _presses
+	_st(0, 0, false, false, Vector2(0.95, 0.97))
+	await _flush()
+	_check(p2 == 1 and _presses == 1, "[%s] second player's tap (index 10) while slot 0 holds touch 0 elsewhere fires pressed exactly once (fired %d; %d after slot 0 lifts)" % [name, p2, _presses])
+
+	var moved: float = await _drag(scroll)
+	_check(moved > 0.0, "[%s] an sd drag inside the ScrollContainer changes scroll_vertical (by %.1f)" % [name, moved])
+	print("INFO [%s] is_touchscreen_available=%s held after row=%s" % [name, DisplayServer.is_touchscreen_available(), _sp.held_touches()])
+	holder.queue_free()
+	await _frames_wait(2)
+
+
+## Press in the ScrollContainer's centre, drag up by 30% of its height in 6
+## moves, lift. Returns how far scroll_vertical moved.
+func _drag(scroll: ScrollContainer) -> float:
+	var before := float(scroll.scroll_vertical)
+	var c := scroll.get_global_rect().get_center()
+	var h := scroll.size.y
+	_st(0, 1, true, false, _norm(c))
+	await _flush()
+	for k in range(1, 7):
+		_sd(0, 1, _norm(c - Vector2(0, h * 0.05 * k)))
+		await _flush()
+	var after := float(scroll.scroll_vertical)
+	_st(0, 1, false, false, _norm(c - Vector2(0, h * 0.3)))
+	await _flush()
+	return after - before
+
+
+func _touch_release() -> void:
+	_touch_rec.got.clear()
+	_st(0, 0, true, false, Vector2(0.9, 0.95))
+	_st(1, 10, true, false, Vector2(0.8, 0.95))
+	await _flush()
+	var held: Array = _sp.held_touches()
+	held.sort()
+	_check(held == [0, 10], "two slots hold touches 0 (slot 0) and 10 (slot 1): %s" % [held])
+	_touch_rec.got.clear()
+	_sp.release_device(1)
+	await _flush()
+	held = _sp.held_touches()
+	_check(held == [0], "release_device(1) lifts slot 1's touch (index 10) and not slot 0's (index 0): held %s" % [held])
+	var lifted := []
+	for g in _touch_rec.got:
+		if g[0] == "st" and not g[2]:
+			lifted.append([g[1], g[3], g[5]])
+	_check(lifted == [[10, true, 1]], "release_device(1) sends one canceled touch, index 10, meta slot 1: %s" % [lifted])
+	_touch_rec.got.clear()
+	_sp.release_all()
+	await _flush()
+	_check(_sp.held_touches().is_empty(), "release_all leaves no held touch: %s" % [_sp.held_touches()])
+	lifted = []
+	for g in _touch_rec.got:
+		if g[0] == "st" and not g[2]:
+			lifted.append([g[1], g[3], g[5]])
+	_check(lifted == [[0, true, 0]], "release_all sends a canceled touch for index 0, meta slot 0: %s" % [lifted])

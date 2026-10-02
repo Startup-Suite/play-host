@@ -8,10 +8,17 @@ extends Node
 ##     {"t":"key","d":0,"k":"W","loc":0,"p":true,"e":false}  k = Godot key name, device d
 ##     {"t":"jb","d":0,"b":0,"p":true,"v":1}                joypad button, device d
 ##     {"t":"ja","d":0,"a":0,"v":-0.5}                     joypad axis, device d
-##     {"t":"release","d":0}  releases what device d holds
+##     {"t":"st","d":0,"i":0,"p":true,"c":false,"x":0.42,"y":0.77}  InputEventScreenTouch
+##     {"t":"sd","d":0,"i":0,"x":0.45,"y":0.70}                     InputEventScreenDrag
+##     {"t":"release","d":0}  releases what device d holds (keys, pads, touches)
 ##     {"t":"release_all"}  {"t":"probe","seq":N}  {"t":"export","on":true}
 ## d is the player SLOT the host bound the input to (P1 = 0), never a value
 ## the browser chose. A key line without d is slot 0 (a v1 host).
+## Touch (task 01a0fe45): i is the Godot touch index, slot*10 + browser id, so
+## two players never share an index. x, y are in [0, 1] of the EXPORTED FRAME
+## (the root viewport's image that _on_frame_post_draw sends) and are
+## mapped to root Window coordinates (frame_to_window), which
+## parse_input_event then takes through the stretch transform like an OS event.
 ##
 ## Device ids (task 01a0dbd6, measured on Godot 4.7.2): a key event's default
 ## device is 16 (the keyboard id), and the built-in ui_* actions are bound to
@@ -46,6 +53,28 @@ extends Node
 ## for P1's keys only; an action set to "All Devices" fires for every slot.
 ## Pads are distinct by polling too, through Input.get_joy_axis(d, ...) and
 ## is_joy_button_pressed(d, ...).
+##
+## Touch, for games (task 01a0fe45): the addon builds InputEventScreenTouch and
+## InputEventScreenDrag ONLY, never a mouse event. Controls activate through
+## Godot's input_devices/pointing/emulate_mouse_from_touch (default on), which
+## emulates the mouse from ONE touch at a time: with two simultaneous players
+## only the first touch down drives the emulated mouse, so only it drives
+## mouse-only Controls (ScrollContainer drag, sliders, text fields). The second
+## player's touch is a ScreenTouch only. BaseButton (Button, CheckBox, ...)
+## also reads a raw ScreenTouch (Godot 4.7.2 base_button.cpp:66), so a second
+## player's tap DOES press a Button, once (measured in godot-tests/selftest.gd);
+## a first player's tap also presses it once, the emulated mouse release firing
+## it and the touch release then finding no press attempt. A game that turns
+## emulate_mouse_from_touch off gets no emulated mouse and must handle
+## ScreenTouch itself. The slot is event.get_meta("suite_play_slot") or
+## event.index / 10.
+## On the first touch line the addon sets Input.emulate_touch_from_mouse, the
+## only thing that makes DisplayServer.is_touchscreen_available() true on a
+## Windows host without a digitizer (Godot 4.7.2 display_server.cpp:583).
+## ScrollContainer drag-scrolls, and TouchScreenButton shows, only when that is
+## true. The play host has no physical mouse, and an emulated mouse event is
+## never turned back into a touch (input.cpp:850, !p_is_emulated), so this adds
+## no second activation.
 
 const CELLS := 4
 const CELL_PX := 16
@@ -91,6 +120,7 @@ var _keycodes := {}  # name -> Key
 var _held_keys := {}  # "d:keycode:loc" -> [keycode, loc, d]
 var _held_buttons := {}  # "d:b" -> [d, b]
 var _held_axes := {}  # "d:a" -> [d, a]
+var _held_touches := {}  # index -> [d, window position, Time.get_ticks_usec()]
 var _checked_key := false
 var _checked_axis := false
 
@@ -196,6 +226,10 @@ func handle_line(line: String) -> void:
 			_joy_button(int(msg.get("d", 0)), int(msg.get("b", 0)), bool(msg.get("p", false)), float(msg.get("v", 0.0)))
 		"ja":
 			_joy_axis(int(msg.get("d", 0)), int(msg.get("a", 0)), float(msg.get("v", 0.0)))
+		"st":
+			_touch(int(msg.get("d", 0)), int(msg.get("i", 0)), bool(msg.get("p", false)), bool(msg.get("c", false)), float(msg.get("x", 0.0)), float(msg.get("y", 0.0)))
+		"sd":
+			_drag(int(msg.get("d", 0)), int(msg.get("i", 0)), float(msg.get("x", 0.0)), float(msg.get("y", 0.0)))
 		"release":
 			release_device(int(msg.get("d", 0)))
 		"release_all":
@@ -280,7 +314,91 @@ func _joy_axis(device: int, axis: int, value: float) -> void:
 		print("suite_play: first axis d%d a%d v=%.3f -> Input.get_joy_axis=%.3f" % [device, axis, value, Input.get_joy_axis(device, axis)])
 
 
-## Releases every key, button and axis this addon pressed, on every device.
+## Size in pixels of the exported frame: the root viewport's render target,
+## which get_image() reads. It is the window size (stretch disabled), the
+## scaled content box inside any black bars (canvas_items) or the base size
+## (viewport): the visible canvas rect times the stretch scale.
+## NOT get_viewport().get_texture().get_size(): for a root Window that applies
+## the stretch scale a second time (Godot 4.7.2 viewport.cpp:174; measured
+## 365x810 for a 405x900 canvas_items render).
+func frame_size() -> Vector2:
+	var vp := get_viewport()
+	return vp.get_visible_rect().size * vp.get_stretch_transform().get_scale()
+
+
+## Normalised exported-frame coordinates -> root Window event coordinates.
+## A Window maps render pixels to window pixels with its window_transform
+## (bar margin, plus the scale in viewport mode), and
+## get_final_transform() = window_transform * stretch * global canvas, so
+## window_transform = final * (stretch * global canvas)^-1.
+## parse_input_event then takes the event back through final^-1, like an OS
+## event, so a Control sees it in canvas coordinates.
+func frame_to_window(x: float, y: float) -> Vector2:
+	var vp := get_viewport()
+	var render := vp.get_stretch_transform() * vp.global_canvas_transform
+	return vp.get_final_transform() * render.affine_inverse() * (Vector2(x, y) * frame_size())
+
+
+## Selftest hook: false skips turning emulate_touch_from_mouse on, so the
+## selftest can measure what a touch drag does without it.
+var touchscreen_on_touch := true
+
+
+func _touch_ready() -> void:
+	if touchscreen_on_touch and not Input.is_emulating_touch_from_mouse():
+		Input.emulate_touch_from_mouse = true
+		print("suite_play: first touch; emulate_touch_from_mouse on (is_touchscreen_available=%s), emulate_mouse_from_touch=%s" % [DisplayServer.is_touchscreen_available(), Input.is_emulating_mouse_from_touch()])
+
+
+static func _touch_event(d: int, index: int, pressed: bool, canceled: bool, pos: Vector2) -> InputEventScreenTouch:
+	var ev := InputEventScreenTouch.new()
+	ev.set_meta(SLOT_META, d)
+	ev.index = index
+	ev.pressed = pressed
+	ev.canceled = canceled
+	ev.position = pos
+	return ev
+
+
+func _touch(d: int, index: int, pressed: bool, canceled: bool, x: float, y: float) -> void:
+	_touch_ready()
+	var pos := frame_to_window(x, y)
+	if pressed:
+		_held_touches[index] = [d, pos, Time.get_ticks_usec()]
+	else:
+		_held_touches.erase(index)
+	Input.parse_input_event(_touch_event(d, index, pressed, canceled and not pressed, pos))
+
+
+## A drag on an index that is not held is not an edge (Godot never sends one).
+func _drag(d: int, index: int, x: float, y: float) -> void:
+	if not _held_touches.has(index):
+		return
+	var pos := frame_to_window(x, y)
+	var h: Array = _held_touches[index]
+	var now := Time.get_ticks_usec()
+	var dt := maxf(float(now - int(h[2])) / 1000000.0, 0.001)
+	var ev := InputEventScreenDrag.new()
+	ev.set_meta(SLOT_META, d)
+	ev.index = index
+	ev.position = pos
+	ev.relative = pos - Vector2(h[1])
+	ev.screen_relative = ev.relative
+	# Input recomputes velocity from its own track of relative; this is the
+	# value a reader of the raw event sees before that.
+	ev.velocity = ev.relative / dt
+	ev.screen_velocity = ev.velocity
+	ev.pressure = 1.0
+	_held_touches[index] = [d, pos, now]
+	Input.parse_input_event(ev)
+
+
+## Touch indices this addon holds pressed (selftest reads it).
+func held_touches() -> Array:
+	return _held_touches.keys()
+
+
+## Releases every key, button, axis and touch this addon pressed, on every device.
 func release_all() -> void:
 	_release(-1)
 
@@ -323,6 +441,12 @@ func _release(device: int) -> void:
 		ev.axis_value = 0.0
 		Input.parse_input_event(ev)
 		_held_axes.erase(id)
+	for index in _held_touches.keys():
+		var t: Array = _held_touches[index]
+		if device >= 0 and t[0] != device:
+			continue
+		Input.parse_input_event(_touch_event(t[0], index, false, true, t[1]))
+		_held_touches.erase(index)
 
 
 func _on_frame_post_draw() -> void:
