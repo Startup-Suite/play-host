@@ -47,6 +47,11 @@ const Feature = "game_stream_host"
 // that declares it, and otherwise keeps v1 single-peer wiring.
 const FeatureMulti = "game_stream_multi"
 
+// FeatureTouch declares that the host forwards touch input (core
+// Protocol.touch_feature/0, task 01a0fe45). Core enables the browser's
+// touch surface only for a host that declares it.
+const FeatureTouch = "game_stream_touch"
+
 // Handler receives broadcasts pushed on the runtime topic.
 type Handler interface {
 	// OnEvent is called for every server push on runtime:<id> other than
@@ -72,7 +77,9 @@ type Config struct {
 	BackoffMax time.Duration // default 30s
 	Logf       func(format string, args ...any)
 	// Features replaces client_info.features (nil = the play host's
-	// [Feature, FeatureMulti]). Only the stress tool sets it.
+	// [Feature, FeatureMulti, FeatureTouch]). The stress tool sets it, and a
+	// test or rig sets it to run a host WITHOUT FeatureTouch: the negative
+	// control for core's touch gate.
 	Features []string
 	// WriteBufferSize is the websocket Dialer's write buffer (0 =
 	// DefaultWriteBufferSize). gorilla sends a message larger than it as a
@@ -203,7 +210,7 @@ func (c *Client) features() []string {
 	if c.cfg.Features != nil {
 		return c.cfg.Features
 	}
-	return []string{Feature, FeatureMulti}
+	return []string{Feature, FeatureMulti, FeatureTouch}
 }
 
 // Run connects, joins and pumps until ctx is done, reconnecting with backoff.

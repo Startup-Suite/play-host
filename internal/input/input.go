@@ -9,6 +9,7 @@
 //	  {"t":"key","code":"KeyW","down":true,"repeat":false,"src":0}
 //	  {"t":"release_all"}
 //	  {"t":"probe","seq":N,"src":0}
+//	  {"t":"touch","src":0,"id":0,"ph":"down","x":0.42,"y":0.77}   (task 01a0fe45)
 //	input-state (unordered, maxRetransmits 0; each message is a full,
 //	idempotent snapshot, so a lost one is corrected by the next):
 //	  {"t":"pad","src":0,"seq":N,"connected":true,
@@ -19,6 +20,8 @@
 //	{"t":"key","d":0,"k":"W","loc":0,"p":true,"e":false}   d: slot; k: Godot key name; loc 0 none, 1 left, 2 right
 //	{"t":"jb","d":0,"b":0,"p":true,"v":1}                 InputEventJoypadButton
 //	{"t":"ja","d":0,"a":0,"v":-0.5}                      InputEventJoypadMotion
+//	{"t":"st","d":0,"i":0,"p":true,"c":false,"x":0.42,"y":0.77}   InputEventScreenTouch
+//	{"t":"sd","d":0,"i":0,"x":0.45,"y":0.70}                      InputEventScreenDrag
 //	{"t":"release","d":0}   releases what device d holds (multi-peer)
 //	{"t":"release_all"}  {"t":"probe","seq":N}  {"t":"export","on":true}
 //
@@ -33,12 +36,20 @@
 // key in a browser message is not even decoded, so a browser cannot name a
 // slot. A peer whose table holds no slot for the message's src has the
 // message dropped and counted (a spectator holds none at all).
+//
+// TOUCH (task 01a0fe45; the contract is core's Platform.GameStream.Protocol
+// moduledoc, "Touch"). id is the browser's pointer id in 0..9; ph is down,
+// move, up or cancel; x, y are in [0, 1] of the displayed video frame. The
+// Godot touch index i is slot*10+id, so two players' id 0 never collide in
+// Godot's global touch index space. No mouse line is ever emitted.
 package input
 
 import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
+	"time"
 )
 
 // Out is one line for the addon.
@@ -55,6 +66,12 @@ type Browser struct {
 	Connected *bool     `json:"connected,omitempty"`
 	Buttons   []float64 `json:"buttons,omitempty"`
 	Axes      []float64 `json:"axes,omitempty"`
+	// Touch (task 01a0fe45). X and Y are pointers so a missing coordinate
+	// is told apart from 0.
+	ID int      `json:"id,omitempty"`
+	Ph string   `json:"ph,omitempty"`
+	X  *float64 `json:"x,omitempty"`
+	Y  *float64 `json:"y,omitempty"`
 }
 
 // Key locations, as Godot's KeyLocation enum.
@@ -149,15 +166,32 @@ type pad struct {
 	axes    [stdAxes]float64
 }
 
+// Touch bounds (task 01a0fe45).
+const (
+	// TouchIDs is how many concurrent touches one slot may hold (ids 0..9),
+	// and the stride of the Godot index slot*TouchIDs+id.
+	TouchIDs = 10
+	// TouchMinInterval is the shortest gap between two accepted moves of one
+	// (slot, id); a move arriving sooner is dropped (DropTouchRate). The
+	// browser already caps moves at the session's move_hz; this bounds a
+	// browser that does not.
+	TouchMinInterval = 4 * time.Millisecond
+)
+
 // Translator holds the diff state for one viewer connection.
 type Translator struct {
-	keys map[int]map[string]bool // slot -> held codes
-	pads map[int]*pad
+	keys    map[int]map[string]bool // slot -> held codes
+	pads    map[int]*pad
+	touches map[int]map[int][2]float64 // slot -> id -> last position
+	touchAt map[int]map[int]time.Time  // slot -> id -> when its last line was emitted
+	// now is the clock for the touch rate bound (tests replace it).
+	now func() time.Time
 }
 
 // NewTranslator starts with nothing held.
 func NewTranslator() *Translator {
-	return &Translator{keys: map[int]map[string]bool{}, pads: map[int]*pad{}}
+	return &Translator{keys: map[int]map[string]bool{}, pads: map[int]*pad{},
+		touches: map[int]map[int][2]float64{}, touchAt: map[int]map[int]time.Time{}, now: time.Now}
 }
 
 // Result is what one browser message turned into.
@@ -180,6 +214,12 @@ type Result struct {
 const (
 	DropNoSlot       = "no slot"
 	DropProbeNoSpace = "probe slot outside the 2-bit namespace"
+	// DropBadTouch: a touch whose id is outside 0..9, whose ph is unknown,
+	// or whose x or y is missing, non-finite or outside [0, 1].
+	DropBadTouch = "bad touch"
+	// DropTouchRate: a move for a (slot, id) under TouchMinInterval after
+	// the previous line for it.
+	DropTouchRate = "touch rate"
 )
 
 // Decode parses one data-channel message.
@@ -217,6 +257,72 @@ func (t *Translator) Key(m Browser, slot int) Result {
 		delete(held, m.Code)
 	}
 	return Result{Lines: []Out{{"t": "key", "d": slot, "k": k.name, "loc": k.loc, "p": m.Down, "e": m.Down && m.Repeat}}, Activity: true, Slot: slot}
+}
+
+func unit(p *float64) bool {
+	return p != nil && !math.IsNaN(*p) && !math.IsInf(*p, 0) && *p >= 0 && *p <= 1
+}
+
+// Touch translates one touch message for slot. A down on an id the slot
+// already holds is a move; a move, up or cancel on an id it does not hold
+// is ignored (not an edge), like a key up without a down.
+func (t *Translator) Touch(m Browser, slot int) Result {
+	switch m.Ph {
+	case "down", "move", "up", "cancel":
+	default:
+		return Result{Slot: slot, Dropped: DropBadTouch}
+	}
+	if m.ID < 0 || m.ID >= TouchIDs || !unit(m.X) || !unit(m.Y) {
+		return Result{Slot: slot, Dropped: DropBadTouch}
+	}
+	x, y := *m.X, *m.Y
+	i := slot*TouchIDs + m.ID
+	held := t.touches[slot]
+	_, isHeld := held[m.ID]
+	now := t.now()
+	switch {
+	case m.Ph == "down" && !isHeld:
+		if held == nil {
+			held = map[int][2]float64{}
+			t.touches[slot] = held
+			t.touchAt[slot] = map[int]time.Time{}
+		}
+		held[m.ID] = [2]float64{x, y}
+		t.touchAt[slot][m.ID] = now
+		return Result{Lines: []Out{{"t": "st", "d": slot, "i": i, "p": true, "c": false, "x": x, "y": y}}, Activity: true, Slot: slot}
+	case !isHeld:
+		return Result{Slot: slot} // move/up/cancel on an id this slot does not hold
+	case m.Ph == "down" || m.Ph == "move":
+		if now.Sub(t.touchAt[slot][m.ID]) < TouchMinInterval {
+			return Result{Slot: slot, Dropped: DropTouchRate}
+		}
+		held[m.ID] = [2]float64{x, y}
+		t.touchAt[slot][m.ID] = now
+		return Result{Lines: []Out{{"t": "sd", "d": slot, "i": i, "x": x, "y": y}}, Activity: true, Slot: slot}
+	default: // up, cancel
+		delete(held, m.ID)
+		delete(t.touchAt[slot], m.ID)
+		return Result{Lines: []Out{{"t": "st", "d": slot, "i": i, "p": false, "c": m.Ph == "cancel", "x": x, "y": y}}, Activity: true, Slot: slot}
+	}
+}
+
+// releaseTouches lifts every touch slot holds as a canceled touch at its
+// last position, in id order, and forgets them.
+func (t *Translator) releaseTouches(slot int) []Out {
+	held := t.touches[slot]
+	ids := make([]int, 0, len(held))
+	for id := range held {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	var out []Out
+	for _, id := range ids {
+		p := held[id]
+		out = append(out, Out{"t": "st", "d": slot, "i": slot*TouchIDs + id, "p": false, "c": true, "x": p[0], "y": p[1]})
+	}
+	delete(t.touches, slot)
+	delete(t.touchAt, slot)
+	return out
 }
 
 func clamp(v, lo, hi float64) float64 {
@@ -310,7 +416,7 @@ func (t *Translator) releaseKeys(slot int) []Out {
 	return out
 }
 
-// ReleaseAll releases every held key and pad input on every slot, then asks
+// ReleaseAll releases every held key, pad input and touch on every slot, then asks
 // the addon to release whatever it believes is held (belt and braces: the
 // addon also tracks what it pressed). This is the v1 (single-peer) release:
 // the addon's release_all drops EVERY device, so a multi-peer session uses
@@ -323,15 +429,25 @@ func (t *Translator) ReleaseAll() []Out {
 	for slot := range t.pads {
 		out = append(out, t.releasePad(slot)...)
 	}
+	slots := make([]int, 0, len(t.touches))
+	for slot := range t.touches {
+		slots = append(slots, slot)
+	}
+	sort.Ints(slots)
+	for _, slot := range slots {
+		out = append(out, t.releaseTouches(slot)...)
+	}
 	return append(out, Out{"t": "release_all"})
 }
 
-// ReleaseSlot releases what this translator holds on one slot, then asks the
+// ReleaseSlot releases what this translator holds on one slot (keys, pad,
+// touches), then asks the
 // addon to release whatever it believes device `slot` holds. The pad's diff
 // state is forgotten, so the next snapshot for the slot starts clean.
 func (t *Translator) ReleaseSlot(slot int) []Out {
 	out := t.releaseKeys(slot)
 	out = append(out, t.releasePad(slot)...)
 	delete(t.pads, slot)
+	out = append(out, t.releaseTouches(slot)...)
 	return append(out, Out{"t": "release", "d": slot})
 }

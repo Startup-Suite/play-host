@@ -19,4 +19,14 @@ Layout:
 - `spike/godot` - throwaway scene; `spike/driver` - CDP latency driver.
 - `docs/spike-01a0db5f.md` - stage 1 findings.
 
+Input (`internal/input`): browser `key`, `pad`, `probe`, `release_all` and,
+since task 01a0fe45, `touch` messages become addon lines. A touch
+`{"t":"touch","src":0,"id":0..9,"ph":"down|move|up|cancel","x":0..1,"y":0..1}`
+becomes `{"t":"st",...}` (InputEventScreenTouch) or `{"t":"sd",...}`
+(InputEventScreenDrag) with Godot index `i = slot*10 + id`. Bad fields are
+dropped as `bad touch`, a move under 4 ms after the last is dropped as
+`touch rate`, and a spectator's touch as `no slot`. The host declares
+`game_stream_touch`; core's `Platform.GameStream.Protocol` "Touch" is the
+contract.
+
 Tests: `go test ./...` (linux) and `GOOS=windows go vet ./...`.

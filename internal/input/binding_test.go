@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func lines(r Result) string {
@@ -135,5 +136,47 @@ func TestSetSlotsReleasesLostSlots(t *testing.T) {
 	p.SetSlots(map[int]int{0: 3})
 	if got := p.SetSlots(map[int]int{0: 3}); len(got) != 0 {
 		t.Fatalf("an unchanged snapshot released %v", got)
+	}
+}
+
+// A spectator's touch (task 01a0fe45) is dropped as DropNoSlot whatever it
+// carries, and a player's touch binds to its table slot, not to any `slot`
+// it names.
+func TestForgedTouch(t *testing.T) {
+	spectator := NewBinding()
+	clocked(spectator)
+	for _, m := range []string{
+		touch(0, "down", 0.5, 0.5),
+		`{"t":"touch","src":0,"id":0,"ph":"down","x":0.5,"y":0.5,"slot":0}`,
+		`{"t":"touch","src":0,"id":99,"ph":"bogus"}`,
+	} {
+		if r := h(t, spectator, "input-events", m); r.Dropped != DropNoSlot || len(r.Lines) != 0 || r.Activity {
+			t.Errorf("spectator %s: %+v", m, r)
+		}
+	}
+	player := NewBinding()
+	player.SetSlots(map[int]int{0: 1})
+	clocked(player)
+	if r := h(t, player, "input-events", `{"t":"touch","src":0,"id":0,"ph":"down","x":0.5,"y":0.5,"slot":0}`); lines(r) != `{"c":false,"d":1,"i":10,"p":true,"t":"st","x":0.5,"y":0.5}` {
+		t.Fatalf("player touch naming slot 0: %q", lines(r))
+	}
+}
+
+// SetSlots losing a slot (a take-over or a leave) lifts that slot's touches
+// and nothing on the slot the peer keeps; Release (peer close) lifts the rest.
+func TestSetSlotsLossReleasesThatSlotsTouches(t *testing.T) {
+	b := NewBinding()
+	b.SetSlots(map[int]int{0: 0, 1: 1})
+	b.tr.now = (&fakeClock{t: time.Unix(1, 0)}).now
+	x := func(v float64) *float64 { return &v }
+	// src 0 only sends touch, so put slot 1's touch on the translator.
+	h(t, b, "input-events", touch(0, "down", 0.1, 0.2))
+	b.tr.Touch(Browser{Ph: "down", ID: 0, X: x(0.7), Y: x(0.8)}, 1)
+	got := fmt.Sprint(b.SetSlots(map[int]int{1: 1}))
+	if got != `[map[c:true d:0 i:0 p:false t:st x:0.1 y:0.2] map[d:0 t:release]]` {
+		t.Fatalf("losing slot 0:\n%s", got)
+	}
+	if got := fmt.Sprint(b.Release()); got != `[map[c:true d:1 i:10 p:false t:st x:0.7 y:0.8] map[d:1 t:release]]` {
+		t.Fatalf("Release:\n%s", got)
 	}
 }

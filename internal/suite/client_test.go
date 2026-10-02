@@ -185,7 +185,8 @@ func TestJoinDeclaresFeatureAndRoutesBroadcasts(t *testing.T) {
 	// game_stream_multi is what makes core send play_peer_open (task
 	// 01a0dbd6): without it core keeps v1 wiring and never asks for a fresh
 	// offer on a same-page re-attach.
-	if len(feats) != 2 || feats[0] != "game_stream_host" || feats[1] != "game_stream_multi" || ci["product"] != "play-host" {
+	// game_stream_touch (task 01a0fe45) turns on core's touch surface.
+	if len(feats) != 3 || feats[0] != "game_stream_host" || feats[1] != "game_stream_multi" || feats[2] != "game_stream_touch" || ci["product"] != "play-host" {
 		t.Fatalf("client_info %v", ci)
 	}
 
@@ -331,5 +332,24 @@ func TestALateHeartbeatWriteIsNotAMissedReply(t *testing.T) {
 	defer fc.mu.Unlock()
 	if fc.beats < 3 {
 		t.Fatalf("only %d beats", fc.beats)
+	}
+}
+
+// The Features override is the negative control for core's touch gate
+// (task 01a0fe45): a host configured without FeatureTouch does not declare
+// it, and the default does.
+func TestFeaturesOverrideDropsTouch(t *testing.T) {
+	def := New(Config{}, nil).features()
+	if fmt.Sprint(def) != "[game_stream_host game_stream_multi game_stream_touch]" {
+		t.Fatalf("default features %v", def)
+	}
+	got := New(Config{Features: []string{Feature, FeatureMulti}}, nil).features()
+	for _, f := range got {
+		if f == FeatureTouch {
+			t.Fatalf("override kept %s: %v", FeatureTouch, got)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("override %v", got)
 	}
 }

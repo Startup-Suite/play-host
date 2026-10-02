@@ -426,3 +426,47 @@ func dropsFor(s *Session, id string) int64 {
 		return -1
 	}
 }
+
+// Touch at the session level (task 01a0fe45): a spectator's forged touch,
+// with or without a `slot`, produces no addon line and is counted against
+// its peer; a player's touch (the positive control) reaches the addon on its
+// table slot with Godot index slot*10+id, and a leave lifts it.
+func TestSpectatorTouchDroppedPlayerTouchReachesTheAddon(t *testing.T) {
+	const port = 40370
+	lr := &logRec{t: t}
+	st := &fakeStages{t: t, port: port, prepared: make(chan struct{})}
+	h, c := newTestHostLog(t, port, st, lr.logf)
+	t.Cleanup(func() { stopAndWait(t, h, "t1") })
+	h.OnEvent(protocol.EventSessionStart, startPayload("t1", 600))
+	peerOpen(h, "t1", "p")
+	peerOpen(h, "t1", "s")
+	slots(h, "t1", 2, map[string]map[string]int{"p": {"0": 1}, "s": {}})
+	p := attach(t, h, c, "p", 0)
+	sp := attach(t, h, c, "s", 0)
+	growing(t, "spectator has video", sp.pkts)
+	eventually(t, "export on", func() bool { return st.game.sawLine(`"on":true`) })
+	before := len(inputLines(st.game.snapshot()))
+
+	sp.events.SendText(`{"t":"touch","src":0,"id":0,"ph":"down","x":0.5,"y":0.5}`)
+	sp.events.SendText(`{"t":"touch","src":0,"id":0,"ph":"down","x":0.5,"y":0.5,"slot":0}`)
+	eventually(t, "2 drops counted for s", func() bool { return dropsFor(h.Current(), "s") == 2 })
+
+	p.events.SendText(`{"t":"touch","src":0,"id":3,"ph":"down","x":0.25,"y":0.75,"slot":0}`)
+	eventually(t, "p's touch on d:1", func() bool { return st.game.sawLine(`"t":"st"`) })
+	after := inputLines(st.game.snapshot())[before:]
+	if fmt.Sprint(after) != `[{"c":false,"d":1,"i":13,"p":true,"t":"st","x":0.25,"y":0.75}]` {
+		t.Fatalf("addon lines after the touches:\n%s", strings.Join(after, "\n"))
+	}
+	if got := lr.find("peer s: dropped"); len(got) == 0 || !strings.Contains(got[0], "no slot") {
+		t.Fatalf("no drop line against peer s: %v", got)
+	}
+	if n := dropsFor(h.Current(), "p"); n != 0 {
+		t.Fatalf("player's touch counted as a drop: %d", n)
+	}
+
+	// The player leaves its slot: the held touch is lifted, canceled.
+	slots(h, "t1", 2, map[string]map[string]int{"p": {}, "s": {}})
+	eventually(t, "touch lifted on leave", func() bool {
+		return st.game.sawLine(`{"c":true,"d":1,"i":13,"p":false,"t":"st","x":0.25,"y":0.75}`)
+	})
+}

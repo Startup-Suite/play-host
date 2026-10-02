@@ -121,7 +121,7 @@ func (b *Binding) Handle(label string, data []byte) (Result, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch m.T {
-	case "key", "pad", "probe":
+	case "key", "pad", "probe", "touch":
 	case "release_all":
 		// Everything this peer holds, and nothing anyone else holds.
 		if len(b.slots) == 0 {
@@ -149,6 +149,8 @@ func (b *Binding) Handle(label string, data []byte) (Result, error) {
 		return b.tr.Key(m, slot), nil
 	case "pad":
 		return b.tr.Pad(m, slot), nil
+	case "touch":
+		return b.tr.Touch(m, slot), nil
 	default: // probe
 		seq := m.Seq
 		if !b.v1 {
