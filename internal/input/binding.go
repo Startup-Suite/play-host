@@ -63,16 +63,25 @@ func (b *Binding) Slots() map[int]int {
 	return out
 }
 
+// SlotChange is one (src, slot) pair SetSlots bound or unbound (task
+// 01a0ff61), so the host can log what a play_slots actually changed.
+type SlotChange struct{ Src, Slot int }
+
 // SetSlots replaces the table with core's snapshot for this peer and returns
 // the release lines for every slot the peer no longer holds (a leave, a
 // take-over), so nothing stays pressed on a slot someone else now drives.
 // A slot that moved to a different src is released too: its held state
 // belonged to the old controller.
-func (b *Binding) SetSlots(table map[int]int) []Out {
+//
+// bound and unbound are the (src, slot) pairs added and removed, sorted by
+// src then slot; a pair whose slot changed is one unbind plus one bind. A
+// snapshot equal to the current table returns none. v1 returns none: its
+// slot 0 is implicit and never changes.
+func (b *Binding) SetSlots(table map[int]int) (lines []Out, bound, unbound []SlotChange) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.v1 {
-		return nil
+		return nil, nil, nil
 	}
 	next := make(map[int]int, len(table))
 	for src, slot := range table {
@@ -84,15 +93,31 @@ func (b *Binding) SetSlots(table map[int]int) []Out {
 	for src, slot := range b.slots {
 		if s, ok := next[src]; !ok || s != slot {
 			lost = append(lost, slot)
+			unbound = append(unbound, SlotChange{Src: src, Slot: slot})
+		}
+	}
+	for src, slot := range next {
+		if s, ok := b.slots[src]; !ok || s != slot {
+			bound = append(bound, SlotChange{Src: src, Slot: slot})
 		}
 	}
 	b.slots = next
 	sort.Ints(lost)
-	var out []Out
+	sortChanges(bound)
+	sortChanges(unbound)
 	for _, slot := range lost {
-		out = append(out, b.tr.ReleaseSlot(slot)...)
+		lines = append(lines, b.tr.ReleaseSlot(slot)...)
 	}
-	return out
+	return lines, bound, unbound
+}
+
+func sortChanges(c []SlotChange) {
+	sort.Slice(c, func(i, j int) bool {
+		if c[i].Src != c[j].Src {
+			return c[i].Src < c[j].Src
+		}
+		return c[i].Slot < c[j].Slot
+	})
 }
 
 // Release releases everything this peer holds (the peer is closing or being
@@ -118,6 +143,12 @@ func (b *Binding) Handle(label string, data []byte) (Result, error) {
 	if err != nil {
 		return Result{Slot: -1}, err
 	}
+	r, err := b.handle(m)
+	r.Type = MsgType(m.T)
+	return r, err
+}
+
+func (b *Binding) handle(m Browser) (Result, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch m.T {

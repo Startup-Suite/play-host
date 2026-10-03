@@ -435,6 +435,34 @@ type peerState struct {
 	dropsTotal atomic.Int64
 	lastDrop   atomic.Int64 // unix nanos of the last drop log line
 	dropWhy    atomic.Value // string
+
+	// Input visibility (task 01a0ff61). All of it is fixed-size and atomic:
+	// pion delivers the two data channels on their own goroutines, and
+	// nothing a browser sends can grow it.
+	msgs      [len(input.MsgTypes)]atomic.Int64 // decoded messages, by input.MsgTypes
+	firstSeen [len(input.MsgTypes)]atomic.Bool  // the "first <type> message" line was logged
+	dropBy    [len(dropReasons)]atomic.Int64    // drops, by dropReasons
+	badParse  atomic.Int64                      // messages input.Decode refused
+	// firstBad is the first unparseable message's shape, stored once by the
+	// goroutine that took badParse from 0 to 1.
+	firstBad   atomic.Pointer[badShape]
+	summarized atomic.Bool // the close summary was logged
+}
+
+// badShape is an unparseable message described without its values.
+type badShape struct {
+	size  int
+	keys  string
+	class string
+}
+
+// dropReasons are the input drop reasons, in summary order, with the name
+// each has in the summary line.
+var dropReasons = [...]struct{ why, name string }{
+	{input.DropNoSlot, "no_slot"},
+	{input.DropProbeNoSpace, "probe_no_space"},
+	{input.DropBadTouch, "bad_touch"},
+	{input.DropTouchRate, "touch_rate"},
 }
 
 func (p *peerState) name() string {
@@ -652,7 +680,9 @@ func (s *Session) reconcile() {
 		}
 	}
 	for id, ps := range s.peers {
-		s.sendLines(ps.in.SetSlots(table[id]))
+		lines, bound, unbound := ps.in.SetSlots(table[id])
+		s.logSlotChanges(ps, bound, unbound)
+		s.sendLines(lines)
 	}
 }
 
@@ -810,8 +840,10 @@ func (s *Session) openPeer(id string, seq int) {
 	} else {
 		ps.in = input.NewBinding()
 		s.pmu.Lock()
-		ps.in.SetSlots(s.table[id])
+		// A fresh binding holds nothing, so there are no release lines.
+		_, bound, unbound := ps.in.SetSlots(s.table[id])
 		s.pmu.Unlock()
+		s.logSlotChanges(ps, bound, unbound)
 	}
 	s.peers[id] = ps
 	go s.guard("offer", func() { s.gatherOffer(ps) })
@@ -871,6 +903,12 @@ func (s *Session) callbacks(ps *peerState, holder **rtc.Peer) rtc.Callbacks {
 		},
 		OnData: func(label string, data []byte) {
 			s.guard("input", func() { s.onInput(ps, label, data) })
+		},
+		OnOpen: func(label string) {
+			if ps.closed.Load() {
+				return
+			}
+			s.logf("peer %s: data channel %s open, slots %s", ps.name(), label, slotTable(ps.in.Slots()))
 		},
 		OnConnected: func() {
 			go s.post(func() {
@@ -971,6 +1009,7 @@ func (s *Session) closePeer(ps *peerState) {
 	ps.peer.Close() // nil-safe
 	s.sendLines(ps.in.Release())
 	s.flushDropsFor(ps, true)
+	s.inputSummary(ps)
 	s.mediaCheck()
 }
 
@@ -1029,8 +1068,10 @@ func (s *Session) onInput(ps *peerState, label string, data []byte) {
 	}
 	r, err := ps.in.Handle(label, data)
 	if err != nil {
+		s.noteUnparseable(ps, label, data, err)
 		return
 	}
+	s.noteType(ps, r, label)
 	if r.Dropped != "" {
 		s.noteDrop(ps, r.Dropped, label)
 		return
@@ -1049,10 +1090,103 @@ func (s *Session) onInput(ps *peerState, label string, data []byte) {
 // noteDrop counts a dropped message; the first one, and then at most one
 // line per DropLogEvery, is logged against the peer.
 func (s *Session) noteDrop(ps *peerState, why, label string) {
+	for i := range dropReasons {
+		if dropReasons[i].why == why {
+			ps.dropBy[i].Add(1)
+		}
+	}
 	ps.dropsTotal.Add(1)
 	ps.drops.Add(1)
 	ps.dropWhy.Store(why + " (" + label + ")")
 	s.flushDropsFor(ps, false)
+}
+
+// noteType counts a decoded message by type and logs the first of each type
+// (task 01a0ff61). It runs before the drop branch, so a spectator's first
+// touch is logged too, with the reason it has no slot. At most
+// len(input.MsgTypes) lines per peer.
+func (s *Session) noteType(ps *peerState, r input.Result, label string) {
+	i := input.MsgTypeIndex(r.Type)
+	ps.msgs[i].Add(1)
+	if !ps.firstSeen[i].CompareAndSwap(false, true) {
+		return
+	}
+	var where string
+	switch {
+	case r.Dropped == input.DropNoSlot:
+		where = "no slot (its src has no entry in the slot table)"
+	case r.Slot < 0 && r.Dropped != "":
+		where = "no slot (" + r.Dropped + ")"
+	case r.Slot < 0: // release_all, an unknown type: not bound to one slot
+		where = "no slot (not slot-bound)"
+	case r.Dropped != "":
+		where = fmt.Sprintf("slot %d, dropped (%s)", r.Slot, r.Dropped)
+	default:
+		where = fmt.Sprintf("slot %d", r.Slot)
+	}
+	s.logf("peer %s: first %s message on %s, %s", ps.name(), input.MsgTypes[i], label, where)
+}
+
+// noteUnparseable counts a message input.Decode refused. The first is
+// logged at once, by size, key names and error class only (task 01a0ff61):
+// never a value, and never the decoder's text, which quotes the input.
+func (s *Session) noteUnparseable(ps *peerState, label string, data []byte, err error) {
+	n := ps.badParse.Add(1)
+	if n != 1 {
+		return
+	}
+	size, keys := input.Shape(data)
+	b := &badShape{size: size, keys: keys, class: input.ErrClass(err)}
+	ps.firstBad.Store(b)
+	s.logf("peer %s: unparseable input message on %s (%d bytes, keys %s, %s); later ones are counted", ps.name(), label, b.size, b.keys, b.class)
+}
+
+// inputSummary logs ps's input counts once, when it closes (task 01a0ff61).
+func (s *Session) inputSummary(ps *peerState) {
+	if !ps.summarized.CompareAndSwap(false, true) {
+		return
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "peer %s: input summary", ps.name())
+	for i, t := range input.MsgTypes {
+		fmt.Fprintf(&b, " %s=%d", t, ps.msgs[i].Load())
+	}
+	bad := ps.badParse.Load()
+	fmt.Fprintf(&b, " unparseable=%d drops", bad)
+	for i := range dropReasons {
+		fmt.Fprintf(&b, " %s=%d", dropReasons[i].name, ps.dropBy[i].Load())
+	}
+	if f := ps.firstBad.Load(); bad > 0 && f != nil {
+		fmt.Fprintf(&b, " first_unparseable=%dB keys %s", f.size, f.keys)
+	}
+	s.logf("%s", b.String())
+}
+
+// logSlotChanges logs what a SetSlots actually changed for ps (task
+// 01a0ff61). reconcile calls SetSlots for every peer on every play_slots,
+// so an unchanged table logs nothing.
+func (s *Session) logSlotChanges(ps *peerState, bound, unbound []input.SlotChange) {
+	for _, c := range unbound {
+		s.logf("peer %s: slot %d unbound (src %d)", ps.name(), c.Slot, c.Src)
+	}
+	for _, c := range bound {
+		s.logf("peer %s: slot %d bound (src %d)", ps.name(), c.Slot, c.Src)
+	}
+}
+
+// slotTable formats a src -> slot table as "[src0:slot ...]", sorted by
+// src; "[]" is a spectator.
+func slotTable(t map[int]int) string {
+	srcs := make([]int, 0, len(t))
+	for src := range t {
+		srcs = append(srcs, src)
+	}
+	sort.Ints(srcs)
+	parts := make([]string, len(srcs))
+	for i, src := range srcs {
+		parts[i] = fmt.Sprintf("src%d:%d", src, t[src])
+	}
+	return "[" + strings.Join(parts, " ") + "]"
 }
 
 func (s *Session) flushDrops(force bool) {
@@ -1162,6 +1296,7 @@ func (s *Session) cleanup() {
 		ps.peer.Close() // nil-safe
 		s.sendLines(ps.in.Release())
 		s.flushDropsFor(ps, true)
+		s.inputSummary(ps)
 	}
 	s.peers = map[string]*peerState{}
 	if s.mux != nil {

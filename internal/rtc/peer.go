@@ -43,8 +43,11 @@ const (
 
 // Callbacks are fixed at NewPeer, before any pion goroutine can call them.
 type Callbacks struct {
-	OnPLI       func()
-	OnData      func(label string, data []byte)
+	OnPLI  func()
+	OnData func(label string, data []byte)
+	// OnOpen fires once per data channel when it opens (task 01a0ff61), so
+	// the host can log that a browser's channel is up before any message.
+	OnOpen      func(label string)
 	OnConnected func()
 	// OnDone fires once: Failed, Closed, or Disconnected for longer than
 	// DisconnectGrace (ICE can recover from a short Disconnected).
@@ -284,6 +287,11 @@ func NewPeerGatherTracks(api *webrtc.API, cfg Config, tracks []webrtc.TrackLocal
 			return nil, "", g, err
 		}
 		label := dc.label
+		ch.OnOpen(func() {
+			if p.cb.OnOpen != nil {
+				p.cb.OnOpen(label)
+			}
+		})
 		ch.OnMessage(func(m webrtc.DataChannelMessage) {
 			if p.cb.OnData != nil {
 				p.cb.OnData(label, m.Data)
