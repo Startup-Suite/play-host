@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -167,7 +168,7 @@ func TestV1BindingAndUnknown(t *testing.T) {
 	if r := h(t, tr, "input-events", `{"t":"key","code":"KeyA","down":true,"src":1}`); r.Dropped != DropNoSlot || len(r.Lines) != 0 {
 		t.Fatalf("v1 src 1: %+v", r)
 	}
-	if lines := tr.SetSlots(map[int]int{}); lines != nil || len(tr.Slots()) != 1 {
+	if lines, _, _ := tr.SetSlots(map[int]int{}); lines != nil || len(tr.Slots()) != 1 {
 		t.Fatalf("a v1 binding must ignore play_slots: %v %v", lines, tr.Slots())
 	}
 }
@@ -326,5 +327,75 @@ func TestBrowserReleaseAllLiftsTouches(t *testing.T) {
 	h(t, b, "input-events", touch(5, "down", 0.5, 0.5))
 	if r := h(t, b, "input-events", `{"t":"release_all"}`); lines(r) != `{"c":true,"d":1,"i":15,"p":false,"t":"st","x":0.5,"y":0.5} {"d":1,"t":"release"}` {
 		t.Fatalf("release_all: %q", lines(r))
+	}
+}
+
+// Shape (task 01a0ff61) describes a message by size and key names only,
+// bounded, and never carries a value.
+func TestShapeNeverCarriesAValue(t *testing.T) {
+	many := map[string]int{}
+	for i := 0; i < ShapeMaxKeys+3; i++ {
+		many[fmt.Sprintf("k%02d", i)] = 7
+	}
+	manyJSON, _ := json.Marshal(many)
+	long := strings.Repeat("L", 40)
+	for _, c := range []struct {
+		name, in, keys string
+	}{
+		{"not json", `not json VALUE`, "not-json"},
+		{"empty", ``, "not-json"},
+		{"array", `["VALUE"]`, "not-an-object"},
+		{"string", `"VALUE"`, "not-an-object"},
+		{"number", `42`, "not-an-object"},
+		{"object", `{"x":"VALUE","t":"touch","a":{"VALUE":1}}`, "[a,t,x]"},
+		{"empty object", `{}`, "[]"},
+		{"many keys", string(manyJSON), "[k00,k01,k02,k03,k04,k05,k06,k07,k08,k09,k10,k11,k12,k13,k14,k15] +3 more"},
+		{"long key", `{"` + long + `":"VALUE"}`, "[" + strings.Repeat("L", ShapeMaxKeyLen) + "]"},
+		{"non-printable key", `{"a\u0001bé c,]d[":"VALUE"}`, "[a?b???c??d?]"}, // \x01, both bytes of é, space, comma, brackets
+	} {
+		size, keys := Shape([]byte(c.in))
+		if size != len(c.in) || keys != c.keys {
+			t.Errorf("%s: Shape = %d %q, want %d %q", c.name, size, keys, len(c.in), c.keys)
+		}
+		if strings.Contains(keys, "VALUE") {
+			t.Errorf("%s: a value reached the shape: %q", c.name, keys)
+		}
+	}
+}
+
+// MsgType collapses every unknown "t" into "other": the set is fixed.
+func TestMsgTypeIsAFixedSet(t *testing.T) {
+	for in, want := range map[string]string{
+		"key": "key", "pad": "pad", "probe": "probe", "touch": "touch", "release_all": "release_all",
+		"": "other", "Key": "other", "export": "other", strings.Repeat("x", 1000): "other",
+	} {
+		if got := MsgType(in); got != want {
+			t.Errorf("MsgType(%.20q) = %q, want %q", in, got, want)
+		}
+		if MsgTypes[MsgTypeIndex(MsgType(in))] != want {
+			t.Errorf("MsgTypeIndex(%q) does not round-trip", want)
+		}
+	}
+}
+
+// ErrClass names a Decode failure without quoting the input.
+func TestErrClassNeverQuotesTheInput(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{`hVALUE`, "syntax@1"},
+		{`{"t":"touch","x":"VALUE"}`, "type:X"},
+		{`{"t":"key","down":"VALUE"}`, "type:Down"},
+		{`{"t":"pad","buttons":["VALUE"]}`, "type:Buttons"},
+		{`{"t":7}`, "type:T"},
+	} {
+		_, err := Decode("input-events", []byte(c.in))
+		if err == nil {
+			t.Fatalf("%s decoded", c.in)
+		}
+		if got := ErrClass(err); got != c.want || strings.Contains(got, "VALUE") {
+			t.Errorf("ErrClass(%s) = %q, want %q (err %v)", c.in, got, c.want, err)
+		}
+	}
+	if got := ErrClass(fmt.Errorf("x")); got != "other" {
+		t.Errorf("ErrClass(other) = %q", got)
 	}
 }

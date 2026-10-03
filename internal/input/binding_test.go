@@ -120,7 +120,7 @@ func TestSetSlotsReleasesLostSlots(t *testing.T) {
 	p := NewBinding()
 	p.SetSlots(map[int]int{0: 0})
 	p.Handle("input-events", []byte(`{"t":"key","code":"KeyD","down":true}`))
-	got := p.SetSlots(map[int]int{})
+	got, _, _ := p.SetSlots(map[int]int{})
 	var s []string
 	for _, l := range got {
 		s = append(s, js(l))
@@ -134,7 +134,7 @@ func TestSetSlotsReleasesLostSlots(t *testing.T) {
 	}
 	// Same table again: nothing to release (idempotent snapshot).
 	p.SetSlots(map[int]int{0: 3})
-	if got := p.SetSlots(map[int]int{0: 3}); len(got) != 0 {
+	if got, _, _ := p.SetSlots(map[int]int{0: 3}); len(got) != 0 {
 		t.Fatalf("an unchanged snapshot released %v", got)
 	}
 }
@@ -172,11 +172,45 @@ func TestSetSlotsLossReleasesThatSlotsTouches(t *testing.T) {
 	// src 0 only sends touch, so put slot 1's touch on the translator.
 	h(t, b, "input-events", touch(0, "down", 0.1, 0.2))
 	b.tr.Touch(Browser{Ph: "down", ID: 0, X: x(0.7), Y: x(0.8)}, 1)
-	got := fmt.Sprint(b.SetSlots(map[int]int{1: 1}))
+	lost, _, _ := b.SetSlots(map[int]int{1: 1})
+	got := fmt.Sprint(lost)
 	if got != `[map[c:true d:0 i:0 p:false t:st x:0.1 y:0.2] map[d:0 t:release]]` {
 		t.Fatalf("losing slot 0:\n%s", got)
 	}
 	if got := fmt.Sprint(b.Release()); got != `[map[c:true d:1 i:10 p:false t:st x:0.7 y:0.8] map[d:1 t:release]]` {
 		t.Fatalf("Release:\n%s", got)
+	}
+}
+
+// SetSlots reports what it changed (task 01a0ff61): the host logs a bind or
+// an unbind only when one happened, so an unchanged play_slots (sent for
+// every peer on every change) logs nothing.
+func TestSetSlotsReportsChanges(t *testing.T) {
+	b := NewBinding()
+	steps := []struct {
+		table          map[int]int
+		bound, unbound string
+	}{
+		{map[int]int{0: 1}, "[{0 1}]", "[]"},
+		{map[int]int{0: 1}, "[]", "[]"}, // unchanged: nothing
+		{map[int]int{2: 3, 0: 1, 1: 0}, "[{1 0} {2 3}]", "[]"},
+		{map[int]int{0: 2, 1: 0, 2: 3}, "[{0 2}]", "[{0 1}]"}, // src 0 moved slot: unbind + bind
+		{map[int]int{1: 0, 3: 2}, "[{3 2}]", "[{0 2} {2 3}]"}, // slot 2 moved src: unbind + bind
+		{map[int]int{1: 0, -1: 4, 5: -2}, "[]", "[{3 2}]"},    // negative entries ignored
+		{map[int]int{}, "[]", "[{1 0}]"},                      // spectator
+		{nil, "[]", "[]"},                                     // still a spectator
+	}
+	for i, st := range steps {
+		_, bound, unbound := b.SetSlots(st.table)
+		if g := fmt.Sprint(bound); g != st.bound && !(st.bound == "[]" && len(bound) == 0) {
+			t.Errorf("step %d %v: bound %s, want %s", i, st.table, g, st.bound)
+		}
+		if g := fmt.Sprint(unbound); g != st.unbound && !(st.unbound == "[]" && len(unbound) == 0) {
+			t.Errorf("step %d %v: unbound %s, want %s", i, st.table, g, st.unbound)
+		}
+	}
+	v1 := NewV1Binding()
+	if lines, bound, unbound := v1.SetSlots(map[int]int{0: 3}); lines != nil || bound != nil || unbound != nil {
+		t.Fatalf("v1 reported a change: %v %v %v", lines, bound, unbound)
 	}
 }

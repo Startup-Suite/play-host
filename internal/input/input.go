@@ -46,9 +46,12 @@ package input
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -208,6 +211,9 @@ type Result struct {
 	// Dropped names why the message was dropped ("" when it was not):
 	// DropNoSlot for a src with no slot in the table.
 	Dropped string
+	// Type is MsgType of the message's "t" (task 01a0ff61), set by
+	// Binding.Handle for every message that decoded; "" when it did not.
+	Type string
 }
 
 // Drop reasons.
@@ -232,6 +238,128 @@ func Decode(label string, data []byte) (Browser, error) {
 		m.Src = 0
 	}
 	return m, nil
+}
+
+// Message types as the host counts and logs them (task 01a0ff61). The set
+// is FIXED: any other "t" a browser sends is TypeOther, so a hostile page
+// cannot grow what the host keeps per peer, and no browser string reaches
+// the log through a type name.
+const (
+	TypeKey        = "key"
+	TypePad        = "pad"
+	TypeProbe      = "probe"
+	TypeTouch      = "touch"
+	TypeReleaseAll = "release_all"
+	TypeOther      = "other"
+)
+
+// MsgTypes is every MsgType value, in the order the host counts them.
+var MsgTypes = [...]string{TypeKey, TypePad, TypeProbe, TypeTouch, TypeReleaseAll, TypeOther}
+
+// MsgType maps a decoded "t" onto MsgTypes.
+func MsgType(t string) string {
+	switch t {
+	case TypeKey, TypePad, TypeProbe, TypeTouch, TypeReleaseAll:
+		return t
+	}
+	return TypeOther
+}
+
+// MsgTypeIndex is MsgType's index in MsgTypes.
+func MsgTypeIndex(t string) int {
+	for i, n := range MsgTypes {
+		if n == t {
+			return i
+		}
+	}
+	return len(MsgTypes) - 1
+}
+
+// Shape bounds (task 01a0ff61).
+const (
+	ShapeMaxKeys   = 16
+	ShapeMaxKeyLen = 32
+)
+
+// Shape describes a message without any of its values: its size in bytes
+// and its sorted top-level JSON key names, "not-json" when it is not JSON,
+// or "not-an-object" when it is JSON but not an object. At most
+// ShapeMaxKeys keys are listed (then "+N more"), each cut to ShapeMaxKeyLen
+// bytes, and every byte outside printable ASCII, and every space, comma and
+// square bracket, is "?", so a key cannot forge the list's syntax or
+// another log line. NEVER a value: it is safe to log.
+func Shape(data []byte) (size int, keys string) {
+	size = len(data)
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return size, "not-json"
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return size, "not-an-object"
+	}
+	names := make([]string, 0, len(obj))
+	for k := range obj {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	more := 0
+	if len(names) > ShapeMaxKeys {
+		more = len(names) - ShapeMaxKeys
+		names = names[:ShapeMaxKeys]
+	}
+	for i, k := range names {
+		names[i] = safeKey(k)
+	}
+	keys = "[" + strings.Join(names, ",") + "]"
+	if more > 0 {
+		keys += fmt.Sprintf(" +%d more", more)
+	}
+	return size, keys
+}
+
+func safeKey(k string) string {
+	if len(k) > ShapeMaxKeyLen {
+		k = k[:ShapeMaxKeyLen]
+	}
+	b := []byte(k)
+	for i, c := range b {
+		if c <= ' ' || c >= 0x7f || c == ',' || c == '[' || c == ']' {
+			b[i] = '?'
+		}
+	}
+	return string(b)
+}
+
+// ErrClass names why Decode failed without quoting the input (task
+// 01a0ff61): json.SyntaxError's text quotes a byte of the message, so it is
+// never logged. "syntax@<offset>" for a syntax error, "type:<Go field>"
+// for a value of the wrong type in a Browser field (the field name comes
+// from our struct, never from the browser), else "other".
+func ErrClass(err error) string {
+	var se *json.SyntaxError
+	if errors.As(err, &se) {
+		return fmt.Sprintf("syntax@%d", se.Offset)
+	}
+	var te *json.UnmarshalTypeError
+	if errors.As(err, &te) {
+		return "type:" + browserField(te.Field)
+	}
+	return "other"
+}
+
+// browserField maps a JSON path from UnmarshalTypeError onto the Browser
+// field it names, or "?" when it names none.
+func browserField(path string) string {
+	rt := reflect.TypeOf(Browser{})
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		tag, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if tag == path || f.Name == path {
+			return f.Name
+		}
+	}
+	return "?"
 }
 
 // Key translates a key edge for slot.
