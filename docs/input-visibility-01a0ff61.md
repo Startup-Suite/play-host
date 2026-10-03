@@ -67,3 +67,48 @@ line is unchanged.
 - `go-checks-01a0ff61-2927941.log`: `gofmt -l .` printed nothing, `go vet ./...` and `GOOS=windows go vet ./...` both exited 0, and `go test -count=1 ./...` passed in every package. These checks ran on hive; this stage is Go, not mix. They ran on the working tree that was then committed. The commit added only this doc and the logs, with no code change.
 - `mutation-m1-01a0ff61-2929890.log`: **M1** replaced `n := ps.badParse.Add(1)` with `ps.badParse.Load() + 1`, which deletes the increment. `TestInputVisibilityCountsAndUnparseable` then failed with `host_visibility_01a0ff61_test.go:184: timed out: 2 unparseable`. host.go was restored by cp-back and is byte-identical to the original, sha256 `289dfcec3b7e44c844e52896fa35b925b438d70e79d0f9618875b2b39a0a3fc0`.
 - `mutation-m2-01a0ff61-2930301.log`: **M2** replaced the first-seen `CompareAndSwap` guard with an unconditional `Store`. The same test then failed with `host_visibility_01a0ff61_test.go:178: first-touch lines = 33 after 33 touches, want exactly 1`. The restore is byte-identical, with the same sha256.
+
+## Wave swap (stage 2)
+
+Prod runs the **unmerged branch tip**. If a later merge changes the tree, the deployer must swap again.
+
+- **Built from** play-host `d32cb808a08719000187845c1e45ddd873fac4b1`, tree `d5e42584b5e9a8b3e7cf0997a4541e71ad8728d4` (`git ls-remote` returned the same tip). It was cross-compiled on hive with `GOOS=windows GOARCH=amd64 go build -ldflags "-X main.Version=<sha>" -o play-host-01a0ff61.exe ./cmd/play-host`.
+- **New exe** sha256 `DBA4517260B9E1C0EACD18247E9A0A9F33BB01983F5DE81C470467060AE4BC7C`.
+- **Old exe** (0664fa0, the 01a0fe45 build) sha256 `9DE64D7A63920846648B12695A9339377799BA7D170021BEC08FC72A22A852AE`.
+- **Backup:** `C:\Users\slaps\play-host\bin\play-host.exe.bak-01a0ff61-20261003T020955Z`, sha256 equal to the old exe. A second copy with the same hash is in `.bak-01a0ff61-20261003T020933Z` (see the first attempt below).
+- **Addon:** this task does not ship it. `addons/suite_play/suite_play.gd` on wave read `EBAF4A793C50801FAFED752D9DE2957D1AF346B4DFF668E7B9050C8F21AA2467` before and after the swap, which equals the branch copy.
+- Prod `config.json` was not touched.
+
+### Idle check (both halves, read-only)
+
+- **(a) wave.** `prodcheck-01a0fe45.ps1` read `PROD_BUSY=False children=0 prod_udp_binds=0`. The last session line was `[01a0ff66-…] session ended: Ended by Ryan Milvenan` (01:41:32Z).
+  - **Positive control:** `prodcheck-control-01a0ff61-*.ps1` runs the same check on a scratch directory whose log ends in an `offer` line followed by one of this task's new `peer …: data channel … open` lines. It read `PROD_BUSY=True`. After a `session ended` line was appended, it read `False`. So the check fires, and the new lines do not mask a live session.
+- **(b) core.** wave's `suite_url` is `wss://suite.kobo-ai.com/runtime/ws`. On moon, `core-platform` has `PHX_HOST=suite.kobo-ai.com`; `core-platform-milv` is the milvenan install. `corecheck-01a0ff61-*.exs` was run with `bin/platform rpc`. It reads presence, the Registry and the DynamicSupervisor count, with no writes. Results: play-host-wave present, `session_for_host` nil, 0 live sessions. The last `game_stream_sessions` row for play-host-wave is 01a0ff66, `ended`.
+  - Not shown: the core half was never seen returning a non-nil session, because no session was live to read.
+
+### Features before and after
+
+| | features | client version |
+|---|---|---|
+| before | `["game_stream_host", "game_stream_multi", "game_stream_touch"]` | `0664fa03fb0179ab761069c90af03aaf65dc18e8` |
+| after | `["game_stream_host", "game_stream_multi", "game_stream_touch"]` | `d32cb808a08719000187845c1e45ddd873fac4b1` |
+
+### Confirm
+
+- The running prod process (pid 12860, `C:\Users\slaps\play-host\bin\play-host.exe`) has image sha256 `DBA45172…AE4BC7C`, equal to the built exe.
+- The log shows `play-host d32cb808a08719000187845c1e45ddd873fac4b1 serve: runtime play-host-wave via wss://suite.kobo-ai.com/runtime/ws`, then `host: joined; ready for play_session_start`.
+- prodcheck afterwards read `PROD_BUSY=False`.
+
+### First attempt (20261003T020933Z) aborted mid-swap; corrected
+
+`deploy-01a0ff61-20261003T020933Z.ps1` had two PowerShell bugs:
+- **Variable name clash.** PowerShell variable names are case-insensitive, so `$staged = <hash>` overwrote the path in `$Staged`. As a result, `Copy-Item` failed after prod was already stopped.
+- **CIM count.** `(ProdPids).Count` is `$null` for one CIM instance in PowerShell 5.1, so the stop-wait loop exited at once. The follow-up `Stop-Process` on the exact prod image path ended the process instead.
+
+The old exe was never overwritten. The task's restart policy brought the old build back at 02:09:39Z, about 5 s down, with no session live. The corrected script (`@(ProdPids).Count`, `$stagedHash`) ran at 20261003T020955Z and reached `DEPLOY_OK`. Both scripts and both transcripts are committed.
+
+### Rollback
+
+On wave, `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\slaps\play-host-01a0ff61-scratch\rollback-01a0ff61.ps1 -Stamp 20261003T020955Z`. A copy of the script is committed as `rollback-01a0ff61-20261003T020955Z.ps1`.
+- It stops `suite-play-host`, copies `.bak-01a0ff61-20261003T020955Z` back and starts the task.
+- Afterwards, check that the image hash reads `9DE64D7A…852AE`, and that core lists the same three features with version 0664fa0.
