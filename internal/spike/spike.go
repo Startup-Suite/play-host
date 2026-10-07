@@ -34,29 +34,41 @@ var webFS embed.FS
 
 // Options configure one harness run.
 type Options struct {
-	Source    string // A | B | C
-	Export    string // C only: image | async
-	Framing   media.Framing
-	Preset    media.Preset
-	Godot     string
-	Project   string
-	FFmpeg    string
-	Session   string
-	GodotPort int
-	RTPPort   int
-	HTTPAddr  string
-	HostIP    string
-	UDPMin    uint16
-	UDPMax    uint16
-	LogDir    string
-	Duration  time.Duration
-	NoGodot   bool // path A/B smoke without a scene
+	Source          string // A | B | C
+	Export          string // C only: image | async
+	Framing         media.Framing
+	Preset          media.Preset
+	Encoder         media.EncoderKind
+	Godot           string
+	RenderingDriver string
+	Project         string
+	FFmpeg          string
+	Session         string
+	GodotPort       int
+	RTPPort         int
+	HTTPAddr        string
+	HostIP          string
+	UDPMin          uint16
+	UDPMax          uint16
+	LogDir          string
+	Duration        time.Duration
+	NoGodot         bool // path A/B smoke without a scene
 }
 
 // Run blocks until Duration elapses, /quit is posted, or a child dies.
 func Run(o Options) error {
 	if err := o.Preset.Validate(); err != nil {
 		return err
+	}
+	if o.Encoder == "" {
+		// Direct callers predate encoder selection; keep their NVENC path.
+		o.Encoder = media.EncoderNVENC
+	}
+	if err := o.Encoder.Validate(); err != nil {
+		return err
+	}
+	if o.Encoder == media.EncoderAuto {
+		return fmt.Errorf("encoder auto must be resolved by cmd/play-host")
 	}
 	if err := os.MkdirAll(o.LogDir, 0o755); err != nil {
 		return err
@@ -145,10 +157,9 @@ func (h *harness) run() error {
 func (h *harness) startGodot() error {
 	o := h.o
 	w, ht := o.Preset.Width, o.Preset.Height
-	args := []string{"--path", o.Project, "--rendering-driver", "vulkan", "--resolution", fmt.Sprintf("%dx%d", w, ht), "--windowed",
-		"--", "--suite-play-session=" + o.Session, fmt.Sprintf("--suite-play-port=%d", o.GodotPort),
-		"--suite-play-export=" + exportMode(o), fmt.Sprintf("--suite-play-fps=%d", o.Preset.FPS)}
-	p, err := launch.Start(launch.Spec{Path: o.Godot, Args: args, Dir: o.Project, LogPath: filepath.Join(o.LogDir, "godot-"+o.Session+".log")})
+	args := launch.GodotArgsForDriver(o.Project, o.RenderingDriver, w, ht, o.Session, o.GodotPort, o.Preset.FPS)
+	args = append(args, "--suite-play-export="+exportMode(o))
+	p, err := launch.Start(launch.Spec{Path: launch.HostGodotExecutable(o.Godot), Args: args, Dir: o.Project, LogPath: filepath.Join(o.LogDir, "godot-"+o.Session+".log")})
 	if err != nil {
 		return err
 	}
@@ -238,7 +249,7 @@ func (h *harness) startEncoder() error {
 		}()
 	}
 
-	args := media.Command(input, o.Preset, o.Framing, o.RTPPort)
+	args := media.CommandForEncoder(input, o.Preset, o.Encoder, o.Framing, o.RTPPort)
 	h.ff = exec.Command(o.FFmpeg, args...)
 	ffLog, err := os.Create(filepath.Join(o.LogDir, "ffmpeg-"+o.Session+".log"))
 	if err != nil {

@@ -1,14 +1,14 @@
 // Package launch starts Godot (and anything else the host owns) so that Stop
-// kills exactly the tree the host started and nothing else.
-//
-// On Windows every process goes into its own Job Object, created SUSPENDED,
-// assigned to the job, then resumed, so a child spawned in the first
-// instruction (the Godot _console wrapper spawns the real exe immediately)
-// is inside the job too. The job has KILL_ON_JOB_CLOSE, so a crashed host
-// takes its Godot with it. Nothing is ever matched or killed by process name.
+// kills exactly the tree the host started and nothing else. Windows retains
+// its Job Object path; Unix platforms use an owned process group.
 package launch
 
-import "fmt"
+import (
+	"fmt"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
 
 // Spec is one process to start.
 type Spec struct {
@@ -22,25 +22,47 @@ type Spec struct {
 type Proc interface {
 	Pid() int
 	Wait() (exitCode int, err error)
-	// Kill terminates every process in the tree the host started.
 	Kill() error
-	// Pids lists the processes currently in the tree (Windows: the job).
 	Pids() ([]int, error)
 }
 
-// GodotArgs is the play command line:
-//
-//	--path <dir> --rendering-driver vulkan --resolution WxH --windowed
-//	-- --suite-play-session=<id> --suite-play-port=<port> --suite-play-fps=<fps>
-//
-// Vulkan because D3D12 fails in wave's session-0 S4U context (stage 1).
-// `--suite-play-session=` is the marker connery-godot-loop.ps1 exempts, so
-// the supervisor never reads a play session as a GUI editor. No
-// `--remote-debug` is ever passed, so the EngineDebugger channel stays
-// inactive.
-func GodotArgs(dir string, w, h int, session string, port, fps int) []string {
-	return []string{
-		"--path", dir, "--rendering-driver", "vulkan", "--resolution", fmt.Sprintf("%dx%d", w, h), "--windowed",
-		"--", "--suite-play-session=" + session, fmt.Sprintf("--suite-play-port=%d", port), fmt.Sprintf("--suite-play-fps=%d", fps),
+// DefaultRenderingDriver preserves the proven explicit Vulkan selection on
+// Windows (and other non-Darwin hosts). On Darwin it is omitted so Godot picks
+// its platform default; config may still request an explicit driver.
+func DefaultRenderingDriver(goos string) string {
+	if goos == "darwin" {
+		return ""
 	}
+	return "vulkan"
+}
+
+// GodotExecutable expands a macOS .app bundle to its conventional executable.
+// Already-expanded paths, PATH lookups ("godot"), Windows executable paths,
+// and paths containing spaces are returned unchanged.
+func GodotExecutable(path, goos string) string {
+	if goos != "darwin" || !strings.EqualFold(filepath.Ext(path), ".app") {
+		return path
+	}
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	return filepath.Join(path, "Contents", "MacOS", base)
+}
+
+// HostGodotExecutable resolves an executable for the running platform.
+func HostGodotExecutable(path string) string { return GodotExecutable(path, runtime.GOOS) }
+
+// GodotArgs is the play command line using the host's native driver.
+func GodotArgs(dir string, w, h int, session string, port, fps int) []string {
+	return GodotArgsForDriver(dir, DefaultRenderingDriver(runtime.GOOS), w, h, session, port, fps)
+}
+
+// GodotArgsForDriver builds the portable play command line. The project path
+// is kept as one argv element; no shell quoting or platform-specific separator
+// rewriting is involved.
+func GodotArgsForDriver(dir, driver string, w, h int, session string, port, fps int) []string {
+	a := []string{"--path", dir}
+	if driver != "" {
+		a = append(a, "--rendering-driver", driver)
+	}
+	a = append(a, "--resolution", fmt.Sprintf("%dx%d", w, h), "--windowed")
+	return append(a, "--", "--suite-play-session="+session, fmt.Sprintf("--suite-play-port=%d", port), fmt.Sprintf("--suite-play-fps=%d", fps))
 }

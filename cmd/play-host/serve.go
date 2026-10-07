@@ -7,46 +7,53 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"time"
 
 	"github.com/Startup-Suite/play-host/internal/build"
 	"github.com/Startup-Suite/play-host/internal/host"
 	"github.com/Startup-Suite/play-host/internal/input"
+	"github.com/Startup-Suite/play-host/internal/launch"
+	"github.com/Startup-Suite/play-host/internal/media"
 	"github.com/Startup-Suite/play-host/internal/suite"
 )
 
 // Version is stamped at build time with -ldflags "-X main.Version=<sha>".
 var Version = "dev"
 
-// FileConfig is C:\Users\slaps\play-host\config.json on wave.
+// FileConfig is the platform-neutral on-disk host configuration.
 type FileConfig struct {
-	SuiteURL        string       `json:"suite_url"`  // ws(s)://host[:port]/runtime/ws
-	RuntimeID       string       `json:"runtime_id"` // play-host-wave
-	TokenFile       string       `json:"token_file"` // secrets\runtime-token (file only)
-	Godot           string       `json:"godot"`      // Godot *_console.exe
-	FFmpeg          string       `json:"ffmpeg"`
-	Git             string       `json:"git"`
-	SSH             string       `json:"ssh"` // Git for Windows usr\bin\ssh.exe
-	KnownHosts      string       `json:"known_hosts"`
-	MirrorsDir      string       `json:"mirrors_dir"`
-	CheckoutsDir    string       `json:"checkouts_dir"`
-	AddonDir        string       `json:"addon_dir"`
-	LogsDir         string       `json:"logs_dir"`
-	HostIP          string       `json:"host_ip"`
-	UDPMin          uint16       `json:"udp_min"`
-	UDPMax          uint16       `json:"udp_max"`
-	GodotPort       int          `json:"godot_port"`
-	RTPPort         int          `json:"rtp_port"`
-	AudioRTPPort    int          `json:"audio_rtp_port"`
-	ImportTimeoutS  int          `json:"import_timeout_s"`
-	KeepCheckouts   int          `json:"keep_checkouts"`
-	Repos           []build.Repo `json:"repos"`
-	HeartbeatS      int          `json:"heartbeat_s"`
-	LaunchTimeoutS  int          `json:"launch_timeout_s"`
-	ProgressEveryMs int          `json:"progress_every_ms"`
+	SuiteURL        string            `json:"suite_url"`  // ws(s)://host[:port]/runtime/ws
+	RuntimeID       string            `json:"runtime_id"` // play-host-wave
+	TokenFile       string            `json:"token_file"` // secrets\runtime-token (file only)
+	Godot           string            `json:"godot"`      // executable, PATH name, or macOS .app bundle
+	RenderingDriver string            `json:"rendering_driver"`
+	FFmpeg          string            `json:"ffmpeg"`
+	Encoder         media.EncoderKind `json:"encoder"`          // auto | nvenc | videotoolbox | libx264
+	EncoderFallback bool              `json:"encoder_fallback"` // fallback to libx264 after chosen encoder init fails
+	Git             string            `json:"git"`
+	SSH             string            `json:"ssh"` // Git for Windows usr\bin\ssh.exe
+	KnownHosts      string            `json:"known_hosts"`
+	MirrorsDir      string            `json:"mirrors_dir"`
+	CheckoutsDir    string            `json:"checkouts_dir"`
+	AddonDir        string            `json:"addon_dir"`
+	LogsDir         string            `json:"logs_dir"`
+	HostIP          string            `json:"host_ip"`
+	UDPMin          uint16            `json:"udp_min"`
+	UDPMax          uint16            `json:"udp_max"`
+	GodotPort       int               `json:"godot_port"`
+	RTPPort         int               `json:"rtp_port"`
+	AudioRTPPort    int               `json:"audio_rtp_port"`
+	ImportTimeoutS  int               `json:"import_timeout_s"`
+	KeepCheckouts   int               `json:"keep_checkouts"`
+	Repos           []build.Repo      `json:"repos"`
+	HeartbeatS      int               `json:"heartbeat_s"`
+	LaunchTimeoutS  int               `json:"launch_timeout_s"`
+	ProgressEveryMs int               `json:"progress_every_ms"`
 	// DEV RIGS ONLY (task 01a0fe45 stage 5); prod config.json sets neither.
 	// LogTouch logs every st/sd line sent to the addon. Features, when
 	// present, replaces client_info.features: ["game_stream_host",
@@ -65,6 +72,15 @@ func LoadConfig(path string) (FileConfig, error) {
 	}
 	if err := json.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("%s: %w", path, err)
+	}
+	if c.Encoder == "" {
+		c.Encoder = media.EncoderAuto
+	}
+	if err := c.Encoder.Validate(); err != nil {
+		return c, fmt.Errorf("%s: %w", path, err)
+	}
+	if c.RenderingDriver == "" {
+		c.RenderingDriver = launch.DefaultRenderingDriver(runtime.GOOS)
 	}
 	if c.UDPMin == 0 {
 		c.UDPMin, c.UDPMax = 40300, 40309
@@ -91,9 +107,54 @@ func LoadConfig(path string) (FileConfig, error) {
 	return c, nil
 }
 
+func selectEncoderForOS(requested media.EncoderKind, goos string) media.EncoderKind {
+	if requested != "" && requested != media.EncoderAuto {
+		return requested
+	}
+	switch goos {
+	case "windows":
+		return media.EncoderNVENC
+	case "darwin":
+		return media.EncoderVideoToolbox
+	default:
+		return media.EncoderLibx264
+	}
+}
+
+func resolveExecutable(name, configured string) (string, error) {
+	clean := filepath.Clean(configured)
+	resolved, err := exec.LookPath(clean)
+	if err != nil {
+		return "", fmt.Errorf("%s executable %q: %w", name, configured, err)
+	}
+	if filepath.IsAbs(resolved) {
+		return resolved, nil
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", fmt.Errorf("%s executable %q: %w", name, configured, err)
+	}
+	return resolved, nil
+}
+
+func (c *FileConfig) resolveExecutables() error {
+	var err error
+	c.Godot = launch.GodotExecutable(c.Godot, runtime.GOOS)
+	for name, value := range map[string]*string{"godot": &c.Godot, "ffmpeg": &c.FFmpeg, "git": &c.Git, "ssh": &c.SSH} {
+		if *value == "" {
+			continue
+		}
+		if *value, err = resolveExecutable(name, *value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c FileConfig) hostConfig() host.Config {
 	return host.Config{
-		Godot: c.Godot, FFmpeg: c.FFmpeg, LogsDir: c.LogsDir, HostIP: c.HostIP, UDPMin: c.UDPMin, UDPMax: c.UDPMax,
+		Godot: c.Godot, RenderingDriver: c.RenderingDriver,
+		FFmpeg: c.FFmpeg, Encoder: selectEncoderForOS(c.Encoder, runtime.GOOS), EncoderFallback: c.EncoderFallback, LogsDir: c.LogsDir, HostIP: c.HostIP, UDPMin: c.UDPMin, UDPMax: c.UDPMax,
 		GodotPort: c.GodotPort, RTPPort: c.RTPPort, AudioRTPPort: c.AudioRTPPort,
 		ImportTimeout: time.Duration(c.ImportTimeoutS) * time.Second,
 		LinkTimeout:   time.Duration(c.LaunchTimeoutS) * time.Second,
@@ -110,6 +171,9 @@ func serve(args []string) error {
 	}
 	c, err := LoadConfig(args[1])
 	if err != nil {
+		return err
+	}
+	if err := c.resolveExecutables(); err != nil {
 		return err
 	}
 	lf, err := setupLogging(c.LogsDir)

@@ -62,25 +62,27 @@ func (r *Rewriter) Rewrite(pkt *rtp.Packet) {
 	r.lastSeq, r.lastTS, r.lastWall = pkt.SequenceNumber, pkt.Timestamp, now
 }
 
-// Pipeline is one ffmpeg h264_nvenc subprocess fed raw RGBA frames on stdin,
-// sending RTP to 127.0.0.1:RTPPort, forwarded to the viewer track. It is
-// stage 1's chosen path (C readback + RTP framing).
+// Pipeline is one ffmpeg H.264 subprocess fed raw RGBA frames on stdin,
+// sending RTP to 127.0.0.1:RTPPort and forwarding it to the viewer track.
 type Pipeline struct {
-	FFmpeg  string
-	Preset  Preset
-	RTPPort int
-	Track   RTPWriter
-	LogPath string
-	Rewrite *Rewriter
-	Counts  *Counters
+	FFmpeg   string
+	Preset   Preset
+	Encoder  EncoderKind // empty preserves the historic explicit NVENC path
+	Fallback bool        // try libx264 only after the selected encoder fails init
+	RTPPort  int
+	Track    RTPWriter
+	LogPath  string
+	Rewrite  *Rewriter
+	Counts   *Counters
 
-	mu    sync.Mutex
-	cmd   *exec.Cmd
-	stdin io.WriteCloser
-	conn  net.PacketConn
-	w, h  int
-	done  chan struct{}
-	Args  []string
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	conn     net.PacketConn
+	w, h     int
+	done     chan struct{}
+	Args     []string
+	Selected EncoderKind // concrete implementation used by the running process
 }
 
 type rewriting struct {
@@ -107,7 +109,31 @@ func (p *Pipeline) Start(w, h int) error {
 	if err != nil {
 		return fmt.Errorf("rtp listen: %w", err)
 	}
-	p.Args = Command(RawInputArgs("rgba", w, h, p.Preset.FPS), p.Preset, FramingRTP, p.RTPPort)
+	selected := p.Selected
+	if selected == "" {
+		selected = p.Encoder
+		if selected == "" {
+			// Backward compatibility for callers predating the machine setting.
+			selected = EncoderNVENC
+		}
+		if selected == EncoderAuto {
+			conn.Close()
+			return errors.New("encoder auto must be resolved before pipeline start")
+		}
+		if _, ok := EncoderSelectors[string(selected)]; !ok {
+			conn.Close()
+			return fmt.Errorf("unknown encoder %q", selected)
+		}
+		selected, err = SelectStartEncoder(selected, p.Fallback, func(kind EncoderKind) error {
+			return InitializeEncoder(p.FFmpeg, p.Preset, kind)
+		})
+		if err != nil {
+			conn.Close()
+			return err
+		}
+		p.Selected = selected
+	}
+	p.Args = CommandForEncoder(RawInputArgs("rgba", w, h, p.Preset.FPS), p.Preset, selected, FramingRTP, p.RTPPort)
 	cmd := exec.Command(p.FFmpeg, p.Args...)
 	var logf *os.File
 	if p.LogPath != "" {
@@ -119,10 +145,16 @@ func (p *Pipeline) Start(w, h int) error {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		conn.Close()
+		if logf != nil {
+			logf.Close()
+		}
 		return err
 	}
 	if err := cmd.Start(); err != nil {
 		conn.Close()
+		if logf != nil {
+			logf.Close()
+		}
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
 	p.Rewrite.NewEpoch()

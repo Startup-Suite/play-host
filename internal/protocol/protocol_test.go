@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/Startup-Suite/play-host/internal/media"
 )
 
 const sha = "0123456789abcdef0123456789abcdef01234567"
@@ -30,11 +32,22 @@ func TestDecodeSessionStart(t *testing.T) {
 	if s.SHA != sha || s.Branch == "" || s.RepoURL == "" || s.IdleTimeoutS != 600 {
 		t.Fatalf("decoded %+v", s)
 	}
-	if s.Encoder.Preset != "p1" || s.Encoder.GOPFrames != 120 || s.Encoder.Width != 1280 {
+	if s.Encoder.EncoderKind() != media.EncoderAuto || s.Encoder.Preset != "p1" || s.Encoder.GOPFrames != 120 || s.Encoder.Width != 1280 {
 		t.Fatalf("encoder %+v", s.Encoder)
 	}
 	if len(s.ICEServers) != 2 || s.ICEServers[0].URLs[0] != "stun:stun.example:3478" || s.ICEServers[1].Username != "u" {
 		t.Fatalf("ice %+v", s.ICEServers)
+	}
+}
+
+func TestDecodeSessionStartEncoderKindIsAdditive(t *testing.T) {
+	b := strings.Replace(startJSON, `"encoder": {`, `"encoder": {"encoder":"videotoolbox",`, 1)
+	s, err := DecodeSessionStart([]byte(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Encoder.EncoderKind() != media.EncoderVideoToolbox {
+		t.Fatalf("encoder kind = %q", s.Encoder.EncoderKind())
 	}
 }
 
