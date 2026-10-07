@@ -1,6 +1,7 @@
 package media
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -81,7 +82,7 @@ func TestLabel(t *testing.T) {
 
 func TestControlPresetMatchesCore(t *testing.T) {
 	// Core's GameStreamEncoder @control (stage 2) and stage 1's chosen arm.
-	want := Preset{Preset: "p1", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
+	want := Preset{Encoder: EncoderAuto, Preset: "p1", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
 	if got := ControlPreset(); got != want {
 		t.Fatalf("control %+v, want %+v", got, want)
 	}
@@ -101,5 +102,122 @@ func TestOddFramesAreCroppedEven(t *testing.T) {
 	odd.Width = 1281
 	if err := odd.Validate(); err != nil {
 		t.Errorf("odd window request must validate (core allows it): %v", err)
+	}
+}
+
+func TestEncoderSelectorTable(t *testing.T) {
+	wantCodec := map[EncoderKind]string{
+		EncoderNVENC:        "h264_nvenc",
+		EncoderVideoToolbox: "h264_videotoolbox",
+		EncoderLibx264:      "libx264",
+	}
+	if len(EncoderSelectors) != len(wantCodec) {
+		t.Fatalf("selectors = %#v", EncoderSelectors)
+	}
+	for kind, codec := range wantCodec {
+		selector, ok := EncoderSelectors[string(kind)]
+		if !ok {
+			t.Fatalf("missing selector %s", kind)
+		}
+		p := DefaultPreset()
+		first, second := selector(p), selector(p)
+		if !slices.Equal(first, second) || argAfter(first, "-c:v") != codec {
+			t.Errorf("selector %s is not deterministic or selected %q: %v / %v", kind, codec, first, second)
+		}
+	}
+}
+
+func TestStartFallbackOnlyAfterFailureWhenEnabled(t *testing.T) {
+	t.Run("disabled does not initialize or fall back", func(t *testing.T) {
+		calls := []EncoderKind{}
+		got, err := SelectStartEncoder(EncoderVideoToolbox, false, func(k EncoderKind) error {
+			calls = append(calls, k)
+			return fmt.Errorf("fail")
+		})
+		if err != nil || got != EncoderVideoToolbox || len(calls) != 0 {
+			t.Fatalf("got %q, %v; calls %v", got, err, calls)
+		}
+	})
+	t.Run("success stays selected", func(t *testing.T) {
+		calls := []EncoderKind{}
+		got, err := SelectStartEncoder(EncoderVideoToolbox, true, func(k EncoderKind) error {
+			calls = append(calls, k)
+			return nil
+		})
+		if err != nil || got != EncoderVideoToolbox || !slices.Equal(calls, []EncoderKind{EncoderVideoToolbox}) {
+			t.Fatalf("got %q, %v; calls %v", got, err, calls)
+		}
+	})
+	t.Run("failure initializes libx264 next", func(t *testing.T) {
+		calls := []EncoderKind{}
+		got, err := SelectStartEncoder(EncoderVideoToolbox, true, func(k EncoderKind) error {
+			calls = append(calls, k)
+			if k == EncoderVideoToolbox {
+				return fmt.Errorf("hardware init failed")
+			}
+			return nil
+		})
+		if err != nil || got != EncoderLibx264 || !slices.Equal(calls, []EncoderKind{EncoderVideoToolbox, EncoderLibx264}) {
+			t.Fatalf("got %q, %v; calls %v", got, err, calls)
+		}
+	})
+}
+
+func TestVideoToolboxLowLatencyArgs(t *testing.T) {
+	got := EncoderArgs(EncoderVideoToolbox, DefaultPreset())
+	want := []string{
+		"-c:v", "h264_videotoolbox",
+		"-realtime", "1",
+		"-prio_speed", "0",
+		"-profile", "baseline",
+		"-b:v", "8000k",
+		"-maxrate", "8000k",
+		"-bufsize", "4000k",
+		"-bf", "0",
+		"-g", "120",
+		"-pix_fmt", "nv12",
+		"-bsf:v", "dump_extra=freq=keyframe",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("VideoToolbox args = %#v\nwant %#v", got, want)
+	}
+}
+
+func TestLibx264LowLatencyAndRepeatHeaders(t *testing.T) {
+	a := EncoderArgs(EncoderLibx264, DefaultPreset())
+	if got := argAfter(a, "-c:v"); got != "libx264" {
+		t.Fatalf("codec = %q", got)
+	}
+	if got := argAfter(a, "-tune"); got != "zerolatency" {
+		t.Fatalf("tune = %q", got)
+	}
+	x := argAfter(a, "-x264-params")
+	for _, setting := range []string{"repeat-headers=1", "keyint=120", "min-keyint=120", "scenecut=0"} {
+		if !strings.Contains(x, setting) {
+			t.Errorf("x264 params missing %q: %q", setting, x)
+		}
+	}
+}
+
+func TestAllEncodersPreserveAnnexBAndRTPJoinInvariants(t *testing.T) {
+	p := DefaultPreset()
+	for _, e := range []EncoderKind{EncoderNVENC, EncoderVideoToolbox, EncoderLibx264} {
+		t.Run(string(e), func(t *testing.T) {
+			a := EncoderArgs(e, p)
+			if argAfter(a, "-bf") != "0" || argAfter(a, "-g") != "120" {
+				t.Errorf("keyframe/B-frame invariant missing: %v", a)
+			}
+			if argAfter(a, "-bsf:v") != "dump_extra=freq=keyframe" {
+				t.Errorf("SPS/PPS repeat invariant missing: %v", a)
+			}
+			annexB := CommandForEncoder(RawInputArgs("rgba", 1280, 720, 60), p, e, FramingAnnexB, 0)
+			if !strings.HasSuffix(strings.Join(annexB, " "), "-f h264 pipe:1") {
+				t.Errorf("not Annex-B output: %v", annexB)
+			}
+			rtp := CommandForEncoder(RawInputArgs("rgba", 1280, 720, 60), p, e, FramingRTP, 40350)
+			if argAfter(rtp, "-payload_type") != "96" || !strings.Contains(strings.Join(rtp, " "), "pkt_size=1200") {
+				t.Errorf("RTP contract changed: %v", rtp)
+			}
+		})
 	}
 }

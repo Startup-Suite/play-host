@@ -1,7 +1,7 @@
 // Command play-host serves a Godot build to one browser over WebRTC.
 //
-//	play-host serve -config C:\Users\slaps\play-host\config.json   (stage 3: the Suite play host)
-//	play-host spike [flags]                                          (stage 1: the frame-path harness)
+//	play-host serve -config /path/to/config.json   (the Suite play host)
+//	play-host spike [flags]                        (the frame-path harness)
 package main
 
 import (
@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"time"
 
+	"github.com/Startup-Suite/play-host/internal/launch"
 	"github.com/Startup-Suite/play-host/internal/media"
 	"github.com/Startup-Suite/play-host/internal/spike"
 )
@@ -35,11 +37,12 @@ func main() {
 	fs := flag.NewFlagSet("spike", flag.ExitOnError)
 	p := media.DefaultPreset()
 	var o spike.Options
-	var framing string
+	var framing, encoder string
 	var dur time.Duration
 	fs.StringVar(&o.Source, "source", "C", "frame path: A (ddagrab) | B (gdigrab) | C (in-engine readback)")
 	fs.StringVar(&o.Export, "export", "image", "path C readback: image | async")
 	fs.StringVar(&framing, "framing", "rtp", "ffmpeg output: rtp | annexb")
+	fs.StringVar(&encoder, "encoder", string(media.EncoderAuto), "H.264 encoder: auto | nvenc | videotoolbox | libx264")
 	fs.StringVar(&p.Preset, "preset", p.Preset, "NVENC preset p1..p7")
 	fs.StringVar(&p.Tune, "tune", p.Tune, "NVENC tune ll | ull")
 	fs.IntVar(&p.BitrateKbps, "bitrate", p.BitrateKbps, "CBR kbps")
@@ -48,7 +51,8 @@ func main() {
 	fs.IntVar(&p.Height, "height", p.Height, "height")
 	fs.IntVar(&p.GOPFrames, "gop", p.GOPFrames, "GOP length in frames")
 	fs.BoolVar(&p.IntraRefresh, "intra-refresh", false, "use -intra-refresh 1")
-	fs.StringVar(&o.Godot, "godot", "", "Godot console exe")
+	fs.StringVar(&o.Godot, "godot", "", "Godot executable or macOS .app bundle")
+	fs.StringVar(&o.RenderingDriver, "rendering-driver", launch.DefaultRenderingDriver(runtime.GOOS), "Godot rendering driver")
 	fs.StringVar(&o.Project, "project", "", "Godot project dir")
 	fs.StringVar(&o.FFmpeg, "ffmpeg", "ffmpeg", "ffmpeg exe")
 	fs.StringVar(&o.Session, "session", "spike-01a0db5f", "session id (the --suite-play-session= marker)")
@@ -63,6 +67,7 @@ func main() {
 	fs.BoolVar(&o.NoGodot, "no-godot", false, "do not launch Godot (A/B smoke)")
 	_ = fs.Parse(os.Args[2:])
 	o.Framing = media.Framing(framing)
+	o.Encoder = selectEncoderForOS(media.EncoderKind(encoder), runtime.GOOS)
 	o.Preset = p
 	o.UDPMin, o.UDPMax = uint16(*udpMin), uint16(*udpMax)
 	o.Duration = dur

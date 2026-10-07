@@ -57,22 +57,25 @@ var newPeerGather = rtc.NewPeerGatherTracks
 
 // Config is everything the engine needs about the machine.
 type Config struct {
-	Godot         string
-	FFmpeg        string
-	Build         build.Config
-	LogsDir       string
-	HostIP        string
-	UDPMin        uint16
-	UDPMax        uint16
-	GodotPort     int
-	RTPPort       int
-	AudioRTPPort  int
-	ImportTimeout time.Duration
-	LinkTimeout   time.Duration
-	ProgressEvery time.Duration // building/progress status cadence (5 s)
-	IdleCheck     time.Duration // how often the idle timer is evaluated (1 s)
-	SkipImport    bool          // tests
-	Loopback      bool          // tests: offer 127.0.0.1 candidates
+	Godot           string
+	RenderingDriver string
+	FFmpeg          string
+	Encoder         media.EncoderKind // concrete host default; auto is resolved in cmd/play-host
+	EncoderFallback bool              // libx264 only after chosen encoder init fails
+	Build           build.Config
+	LogsDir         string
+	HostIP          string
+	UDPMin          uint16
+	UDPMax          uint16
+	GodotPort       int
+	RTPPort         int
+	AudioRTPPort    int
+	ImportTimeout   time.Duration
+	LinkTimeout     time.Duration
+	ProgressEvery   time.Duration // building/progress status cadence (5 s)
+	IdleCheck       time.Duration // how often the idle timer is evaluated (1 s)
+	SkipImport      bool          // tests
+	Loopback        bool          // tests: offer 127.0.0.1 candidates
 	// OfferAttempts bounds how many times one offer is tried before the
 	// session fails (0 = 3); OfferBackoff is the wait before the first retry,
 	// doubled each time (0 = 500 ms). Stage 6: one failed re-offer after a
@@ -159,6 +162,11 @@ func New(cfg Config, send Sender, stages Stages, logf func(string, ...any)) *Hos
 	}
 	if cfg.OfferBackoff <= 0 {
 		cfg.OfferBackoff = 500 * time.Millisecond
+	}
+	if cfg.Encoder == "" || cfg.Encoder == media.EncoderAuto {
+		// Direct library callers predate the machine setting; keep their
+		// established Windows/NVENC behavior. serve resolves auto per GOOS.
+		cfg.Encoder = media.EncoderNVENC
 	}
 	if cfg.ResumeGrace == 0 {
 		cfg.ResumeGrace = DefaultResumeGrace
@@ -808,7 +816,11 @@ func (s *Session) setupMedia() error {
 		return err
 	}
 	s.api, s.rtcCfg, s.track, s.audioTrack = api, cfg, track, audioTrack
-	s.enc = &media.Pipeline{FFmpeg: s.h.cfg.FFmpeg, Preset: s.start.Encoder, RTPPort: s.h.cfg.RTPPort, Track: track,
+	encoder := s.start.Encoder.EncoderKind()
+	if encoder == media.EncoderAuto {
+		encoder = s.h.cfg.Encoder
+	}
+	s.enc = &media.Pipeline{FFmpeg: s.h.cfg.FFmpeg, Preset: s.start.Encoder, Encoder: encoder, Fallback: s.h.cfg.EncoderFallback, RTPPort: s.h.cfg.RTPPort, Track: track,
 		LogPath: filepath.Join(s.h.cfg.LogsDir, "ffmpeg-"+s.ID()+".log"), Counts: &media.Counters{}}
 	s.audio = &media.AudioPipeline{FFmpeg: s.h.cfg.FFmpeg, RTPPort: s.h.cfg.AudioRTPPort, Track: audioTrack,
 		LogPath: filepath.Join(s.h.cfg.LogsDir, "ffmpeg-audio-"+s.ID()+".log"), Counts: &media.Counters{}}
@@ -1402,7 +1414,7 @@ func (r *realStages) AssertHead(ctx context.Context, dir, sha string) error {
 
 func (r *realStages) Launch(dir string, st protocol.SessionStart, logPath string) (launch.Proc, error) {
 	cfg := r.h.cfg
-	args := launch.GodotArgs(dir, st.Encoder.Width, st.Encoder.Height, st.SessionID, cfg.GodotPort, st.Encoder.FPS)
+	args := launch.GodotArgsForDriver(dir, cfg.RenderingDriver, st.Encoder.Width, st.Encoder.Height, st.SessionID, cfg.GodotPort, st.Encoder.FPS)
 	r.h.logf("launch: %s %v", cfg.Godot, args)
 	return launch.Start(launch.Spec{Path: cfg.Godot, Args: args, Dir: dir, LogPath: logPath})
 }

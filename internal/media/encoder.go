@@ -1,47 +1,73 @@
-// Package media builds the ffmpeg h264_nvenc subprocess and turns its output
-// into WebRTC video.
-//
-// The NVENC option defaults are ported from cloudplay
-// (pkg/encoder/nvenc/nvenc.go:70-99, Apache-2.0, see NOTICE): CBR, an rc
-// buffer of about two frames, zerolatency, no lookahead, no B-frames,
-// forced IDR, baseline profile, preset p4 / tune ll. cloudplay drives
-// libavcodec through cgo; v1 of the play host drives ffmpeg.exe as a
-// subprocess instead, so the binary cross-compiles with CGO_ENABLED=0.
+// Package media builds low-latency H.264 ffmpeg commands and turns their
+// output into WebRTC video.
 package media
 
 import (
+	"bytes"
 	"fmt"
+	"os/exec"
 	"strconv"
+	"strings"
 )
+
+// EncoderKind identifies an ffmpeg H.264 implementation. Auto is resolved by
+// the host entry point before a pipeline starts.
+type EncoderKind string
+
+const (
+	EncoderAuto         EncoderKind = "auto"
+	EncoderNVENC        EncoderKind = "nvenc"
+	EncoderVideoToolbox EncoderKind = "videotoolbox"
+	EncoderLibx264      EncoderKind = "libx264"
+)
+
+// Validate rejects unknown encoder names. The zero value is accepted as auto
+// so play_session_start frames from older versions keep working.
+func (e EncoderKind) Validate() error {
+	if e == "" {
+		e = EncoderAuto
+	}
+	switch e {
+	case EncoderAuto, EncoderNVENC, EncoderVideoToolbox, EncoderLibx264:
+		return nil
+	default:
+		return fmt.Errorf("encoder %q not in auto|nvenc|videotoolbox|libx264", e)
+	}
+}
 
 // Preset is one arm of the game_stream.encoder_preset experiment surface.
 type Preset struct {
-	Preset       string `json:"preset"`       // p1..p7
-	Tune         string `json:"tune"`         // ll | ull
-	BitrateKbps  int    `json:"bitrate_kbps"` // CBR target
-	FPS          int    `json:"fps"`
-	Width        int    `json:"width"`
-	Height       int    `json:"height"`
-	GOPFrames    int    `json:"gop_frames"`              // bounded GOP; the subprocess cannot force an IDR on PLI
-	IntraRefresh bool   `json:"intra_refresh,omitempty"` // -intra-refresh 1 instead of periodic IDR
+	Encoder      EncoderKind `json:"encoder,omitempty"` // additive; omitted means auto
+	Preset       string      `json:"preset"`            // NVENC p1..p7
+	Tune         string      `json:"tune"`              // NVENC ll | ull
+	BitrateKbps  int         `json:"bitrate_kbps"`      // common CBR target
+	FPS          int         `json:"fps"`
+	Width        int         `json:"width"`
+	Height       int         `json:"height"`
+	GOPFrames    int         `json:"gop_frames"`
+	IntraRefresh bool        `json:"intra_refresh,omitempty"`
 }
 
-// DefaultPreset is cloudplay's default arm at 720p60.
 func DefaultPreset() Preset {
-	return Preset{Preset: "p4", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
+	return Preset{Encoder: EncoderAuto, Preset: "p4", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
 }
 
-// ControlPreset is stage 1's measured control arm and core's
-// GameStreamEncoder.control/0: p1 / ll, 8000 kbps CBR, 1280x720 at 60 fps,
-// GOP 120. Width and height are what the host ASKS Godot for; the session-0
-// desktop clamps the window (1028x720 on wave), and the encoder is always
-// sized from the frames the addon actually exports.
 func ControlPreset() Preset {
-	return Preset{Preset: "p1", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
+	return Preset{Encoder: EncoderAuto, Preset: "p1", Tune: "ll", BitrateKbps: 8000, FPS: 60, Width: 1280, Height: 720, GOPFrames: 120}
 }
 
-// Validate rejects values ffmpeg would refuse or that make no sense on a LAN.
+// EncoderKind returns the normalized kind carried by this preset.
+func (p Preset) EncoderKind() EncoderKind {
+	if p.Encoder == "" {
+		return EncoderAuto
+	}
+	return p.Encoder
+}
+
 func (p Preset) Validate() error {
+	if err := p.EncoderKind().Validate(); err != nil {
+		return err
+	}
 	switch p.Preset {
 	case "p1", "p2", "p3", "p4", "p5", "p6", "p7":
 	default:
@@ -56,8 +82,6 @@ func (p Preset) Validate() error {
 	if p.FPS < 10 || p.FPS > 144 {
 		return fmt.Errorf("fps %d out of 10..144", p.FPS)
 	}
-	// Parity is not checked: core's surface allows odd sizes, the size is only
-	// a window request, and RawInputArgs crops odd frames to even.
 	if p.Width < 64 || p.Height < 64 || p.Width > 7680 || p.Height > 4320 {
 		return fmt.Errorf("size %dx%d out of 64x64..7680x4320", p.Width, p.Height)
 	}
@@ -67,7 +91,6 @@ func (p Preset) Validate() error {
 	return nil
 }
 
-// Label is a short stable name for logs and the spike doc.
 func (p Preset) Label() string {
 	s := fmt.Sprintf("%s-%s-%dk-%dp%d-g%d", p.Preset, p.Tune, p.BitrateKbps, p.Height, p.FPS, p.GOPFrames)
 	if p.IntraRefresh {
@@ -76,10 +99,8 @@ func (p Preset) Label() string {
 	return s
 }
 
-// EncoderArgs is the output-side codec block, ported from cloudplay's defaults.
-func (p Preset) EncoderArgs() []string {
+func nvencArgs(p Preset) []string {
 	br := strconv.Itoa(p.BitrateKbps) + "k"
-	// cloudplay: rc_buffer_size = bitrate/30, about two frames at 60 fps.
 	buf := strconv.Itoa(max(p.BitrateKbps/30, 1)) + "k"
 	a := []string{
 		"-c:v", "h264_nvenc",
@@ -98,41 +119,127 @@ func (p Preset) EncoderArgs() []string {
 	if p.IntraRefresh {
 		a = append(a, "-intra-refresh", "1")
 	}
-	// In-band SPS/PPS before every keyframe: the browser joins mid-stream and
-	// the RTP muxer would otherwise put them only in its (unused) SDP.
-	a = append(a, "-bsf:v", "dump_extra=freq=keyframe")
-	return a
+	return append(a, "-bsf:v", "dump_extra=freq=keyframe")
 }
 
-// Framing is how encoded video leaves ffmpeg.
+func videoToolboxArgs(p Preset) []string {
+	br := strconv.Itoa(p.BitrateKbps) + "k"
+	buf := strconv.Itoa(max(p.BitrateKbps/2, 1)) + "k"
+	return []string{
+		"-c:v", "h264_videotoolbox",
+		"-realtime", "1",
+		"-prio_speed", "0",
+		"-profile", "baseline",
+		"-b:v", br,
+		"-maxrate", br,
+		"-bufsize", buf,
+		"-bf", "0",
+		"-g", strconv.Itoa(p.GOPFrames),
+		"-pix_fmt", "nv12",
+		"-bsf:v", "dump_extra=freq=keyframe",
+	}
+}
+
+func libx264Args(p Preset) []string {
+	br := strconv.Itoa(p.BitrateKbps) + "k"
+	buf := strconv.Itoa(max(p.BitrateKbps/2, 1)) + "k"
+	x264 := strings.Join([]string{
+		"nal-hrd=cbr", "force-cfr=1", "repeat-headers=1",
+		"keyint=" + strconv.Itoa(p.GOPFrames), "min-keyint=" + strconv.Itoa(p.GOPFrames), "scenecut=0",
+	}, ":")
+	return []string{
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		"-profile:v", "baseline",
+		"-b:v", br,
+		"-maxrate", br,
+		"-bufsize", buf,
+		"-bf", "0",
+		"-g", strconv.Itoa(p.GOPFrames),
+		"-pix_fmt", "yuv420p",
+		"-x264-params", x264,
+		"-bsf:v", "dump_extra=freq=keyframe",
+	}
+}
+
+// EncoderSelectors is the data-driven encoder experiment surface. Each value
+// is a pure Preset -> ffmpeg argv selector; changing arms requires data, not a
+// branch inside EncoderArgs.
+var EncoderSelectors = map[string]func(Preset) []string{
+	string(EncoderNVENC):        nvencArgs,
+	string(EncoderVideoToolbox): videoToolboxArgs,
+	string(EncoderLibx264):      libx264Args,
+}
+
+// EncoderArgs selects a concrete encoder's arguments. Callers validate and
+// resolve auto before calling it. Deliberately no encoder branching lives here.
+func EncoderArgs(kind EncoderKind, p Preset) []string {
+	return EncoderSelectors[string(kind)](p)
+}
+
+// EncoderArgs keeps the historic API and Windows/NVENC argv byte-for-byte.
+func (p Preset) EncoderArgs() []string { return EncoderArgs(EncoderNVENC, p) }
+
+// SelectStartEncoder performs a start-time software fallback. The chosen
+// encoder is initialized first; libx264 is attempted only after that init
+// fails and only when fallback is enabled.
+func SelectStartEncoder(chosen EncoderKind, fallback bool, init func(EncoderKind) error) (EncoderKind, error) {
+	if !fallback || chosen == EncoderLibx264 {
+		return chosen, nil
+	}
+	if err := init(chosen); err == nil {
+		return chosen, nil
+	} else if fallbackErr := init(EncoderLibx264); fallbackErr != nil {
+		return "", fmt.Errorf("initialize %s: %v; initialize libx264 fallback: %w", chosen, err, fallbackErr)
+	}
+	return EncoderLibx264, nil
+}
+
+// InitializeEncoder proves that ffmpeg can initialize a concrete encoder by
+// encoding one in-memory RGBA frame. RawInputArgs deliberately asks ffmpeg for
+// a tiny probe buffer and no input buffering; current ffmpeg consumes the first
+// raw frame while probing, so feed three frames even though only one is encoded.
+// It is used only when fallback is enabled, so the established Windows/NVENC
+// startup path is unchanged.
+func InitializeEncoder(ffmpeg string, p Preset, kind EncoderKind) error {
+	probe := p
+	probe.FPS, probe.Width, probe.Height, probe.GOPFrames = 10, 64, 64, 10
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostats", "-y"}
+	args = append(args, RawInputArgs("rgba", probe.Width, probe.Height, probe.FPS)...)
+	args = append(args, EncoderArgs(kind, probe)...)
+	args = append(args, "-frames:v", "1")
+	args = append(args, OutputArgs(FramingAnnexB, 0)...)
+	cmd := exec.Command(ffmpeg, args...)
+	cmd.Stdin = bytes.NewReader(make([]byte, probe.Width*probe.Height*4*3))
+	if out, err := cmd.Output(); err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("ffmpeg %s init: %w: %s", kind, err, strings.TrimSpace(string(exit.Stderr)))
+		}
+		return fmt.Errorf("ffmpeg %s init: %w", kind, err)
+	} else if len(out) == 0 {
+		return fmt.Errorf("ffmpeg %s init produced no H.264", kind)
+	}
+	return nil
+}
+
 type Framing string
 
 const (
-	// FramingRTP: ffmpeg's RTP muxer on 127.0.0.1, forwarded packet-by-packet
-	// to a pion TrackLocalStaticRTP. The marker bit ends a frame, so nothing
-	// waits for the next frame's start code.
-	FramingRTP Framing = "rtp"
-	// FramingAnnexB: Annex-B on stdout read with pion's h264reader. A NAL is
-	// only complete when the NEXT start code arrives, which costs up to one
-	// frame interval. Kept because the plan specified it; the spike measures both.
+	FramingRTP    Framing = "rtp"
 	FramingAnnexB Framing = "annexb"
 )
 
-// OutputArgs is the muxer block for f. rtpPort is used only by FramingRTP.
 func OutputArgs(f Framing, rtpPort int) []string {
 	common := []string{"-an", "-flush_packets", "1"}
 	switch f {
 	case FramingAnnexB:
 		return append(common, "-f", "h264", "pipe:1")
 	default:
-		return append(common, "-f", "rtp", "-payload_type", "96",
-			fmt.Sprintf("rtp://127.0.0.1:%d?pkt_size=1200", rtpPort))
+		return append(common, "-f", "rtp", "-payload_type", "96", fmt.Sprintf("rtp://127.0.0.1:%d?pkt_size=1200", rtpPort))
 	}
 }
 
-// RawInputArgs reads raw frames on stdin at wall-clock timestamps (frame path C).
-// NVENC accepts rgba/bgra directly and converts to YUV on the GPU.
-// An odd frame size is cropped to even (a CPU filter hop, so only when needed).
 func RawInputArgs(pixFmt string, w, h, fps int) []string {
 	a := []string{
 		"-f", "rawvideo", "-pix_fmt", pixFmt, "-video_size", fmt.Sprintf("%dx%d", w, h),
@@ -146,20 +253,22 @@ func RawInputArgs(pixFmt string, w, h, fps int) []string {
 	return a
 }
 
-// DDAGrabInputArgs is frame path A (DXGI desktop duplication, D3D11 frames).
 func DDAGrabInputArgs(fps int) []string {
 	return []string{"-f", "lavfi", "-i", fmt.Sprintf("ddagrab=output_idx=0:framerate=%d:draw_mouse=0", fps)}
 }
 
-// GDIGrabInputArgs is frame path B (GDI BitBlt of one window by title).
 func GDIGrabInputArgs(title string, fps int) []string {
 	return []string{"-f", "gdigrab", "-framerate", strconv.Itoa(fps), "-draw_mouse", "0", "-i", "title=" + title}
 }
 
-// Command assembles a full ffmpeg argument list.
+// Command preserves the historic NVENC API.
 func Command(input []string, p Preset, f Framing, rtpPort int) []string {
+	return CommandForEncoder(input, p, EncoderNVENC, f, rtpPort)
+}
+
+func CommandForEncoder(input []string, p Preset, e EncoderKind, f Framing, rtpPort int) []string {
 	a := []string{"-hide_banner", "-loglevel", "warning", "-nostats", "-y"}
 	a = append(a, input...)
-	a = append(a, p.EncoderArgs()...)
+	a = append(a, EncoderArgs(e, p)...)
 	return append(a, OutputArgs(f, rtpPort)...)
 }
