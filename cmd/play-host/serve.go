@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"syscall"
 	"time"
 
 	"github.com/Startup-Suite/play-host/internal/build"
@@ -196,7 +197,7 @@ func serve(args []string) error {
 	cl := suite.New(suite.Config{URL: c.SuiteURL, RuntimeID: c.RuntimeID, TokenFile: c.TokenFile, Product: "play-host",
 		Version: Version, Heartbeat: time.Duration(c.HeartbeatS) * time.Second, Features: c.Features}, h)
 	h.SetSender(cl)
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	cl.Run(ctx)
 	if s := h.Current(); s != nil {
