@@ -197,8 +197,11 @@ func SelectStartEncoder(chosen EncoderKind, fallback bool, init func(EncoderKind
 }
 
 // InitializeEncoder proves that ffmpeg can initialize a concrete encoder by
-// encoding one in-memory RGBA frame. It is used only when fallback is enabled,
-// so the established Windows/NVENC startup path is unchanged.
+// encoding one in-memory RGBA frame. RawInputArgs deliberately asks ffmpeg for
+// a tiny probe buffer and no input buffering; current ffmpeg consumes the first
+// raw frame while probing, so feed three frames even though only one is encoded.
+// It is used only when fallback is enabled, so the established Windows/NVENC
+// startup path is unchanged.
 func InitializeEncoder(ffmpeg string, p Preset, kind EncoderKind) error {
 	probe := p
 	probe.FPS, probe.Width, probe.Height, probe.GOPFrames = 10, 64, 64, 10
@@ -208,7 +211,7 @@ func InitializeEncoder(ffmpeg string, p Preset, kind EncoderKind) error {
 	args = append(args, "-frames:v", "1")
 	args = append(args, OutputArgs(FramingAnnexB, 0)...)
 	cmd := exec.Command(ffmpeg, args...)
-	cmd.Stdin = bytes.NewReader(make([]byte, probe.Width*probe.Height*4))
+	cmd.Stdin = bytes.NewReader(make([]byte, probe.Width*probe.Height*4*3))
 	if out, err := cmd.Output(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("ffmpeg %s init: %w: %s", kind, err, strings.TrimSpace(string(exit.Stderr)))

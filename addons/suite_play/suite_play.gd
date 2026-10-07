@@ -247,7 +247,13 @@ func handle_line(line: String) -> void:
 ## Measured on wave: without this, "Meta" resolved to KEY_NONE.
 func keycode_for(name: String) -> int:
 	if not _keycodes.has(name):
-		_keycodes[name] = KEY_META if name == "Meta" else OS.find_keycode_from_string(name)
+		match name:
+			"Meta":
+				_keycodes[name] = KEY_META
+			"Alt":
+				_keycodes[name] = KEY_ALT
+			_:
+				_keycodes[name] = OS.find_keycode_from_string(name)
 	return int(_keycodes[name])
 
 
